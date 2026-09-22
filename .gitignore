@@ -191,3 +191,6 @@ scripts/images
 checkpoint*.pt
 test/
 *.csv
+
+# models
+teachers/

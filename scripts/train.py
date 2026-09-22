@@ -6,6 +6,7 @@ import einops
 import wandb
 import logging
 import os
+import sys
 import time
 import datetime
 
@@ -14,6 +15,8 @@ from collections import OrderedDict
 from tqdm import tqdm
 from setproctitle import setproctitle
 
+# Prefer this checkout over an editable install from another VAIC repository.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import active_adaptation as aa
 from isaaclab.app import AppLauncher
 # from active_adaptation.utils.torchrl import SyncDataCollector
@@ -34,6 +37,16 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
 @hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
 def main(cfg: DictConfig):
+    if cfg.algo.get("runner") == "gpo":
+        from active_adaptation.learning.gpo.runner import train
+        return train(cfg)
+    if cfg.algo.get("runner") == "cts":
+        from active_adaptation.learning.cts.runner import train
+        return train(cfg)
+    if cfg.algo.get("runner") == "sitt":
+        from active_adaptation.learning.sitt.runner import train
+        return train(cfg)
+
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     
@@ -211,4 +224,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

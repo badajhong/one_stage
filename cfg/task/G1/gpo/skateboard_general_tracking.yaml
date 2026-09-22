@@ -1,0 +1,109 @@
+# Snapshot of CTS skateboard task; tests enforce environment parity.
+# @package task
+defaults:
+  - /task/base/hdmi-base
+  - _self_
+
+name: G1GPOSkateboardGeneralTracking
+
+enable_cameras: true
+camera_width: 64
+camera_height: 36
+num_envs: 1024
+
+viewer:
+  env_spacing: 5.0
+  lookat: [0.5, -2.5, 0.8]
+  eye: [3, 2, 1.]
+
+terrain: plane
+
+robot:
+  name: g1
+  robot_type: g1_29dof_rubberhand-feet_box-eef_box-body_capsule
+
+command:
+  data_path:
+    - data/motion/g1/mirobotA/board6
+    - data/motion/g1/mirobotA/board6_mirror
+  root_body_name: pelvis
+  replay_motion: false
+  pose_range:
+    y: [-0.01, 0.01]
+    z: [-0.0, 0.0]
+  object_asset_name: skateboard
+  object_body_name: board_deck
+  object_joint_name: [front_left_wheel_joint, front_right_wheel_joint, rear_left_wheel_joint, rear_right_wheel_joint]
+  object_pose_range:
+    x: [-0.0, 0.0]
+    y: [-0.0, 0.0]
+    z: [-0.0, 0.0]
+    roll: [-0.0, 0.0]
+    pitch: [-0.0, 0.0]
+    yaw: [-0.1, 0.1]
+  contact_eef_body_name: [right_ankle_roll_link, left_ankle_roll_link]
+  contact_eef_pos_offset:
+    - [0.0, 0.0, -0.06]
+    - [0.0, 0.0, -0.06]
+  contact_target_pos_offset:
+    - [0.12, -0.025, 0.02]
+    - [-0.15, -0.025, 0.02]
+  contact_target_pos_offset_per_motion:
+    - [[0.12, -0.025, 0.02], [-0.15, -0.025, 0.02]]
+    - [[-0.15, 0.025, 0.02], [0.12, 0.025, 0.02]]
+  contact_eef_pos_offset_per_motion:
+    - [[0.0, 0.0, -0.06], [0.0, 0.0, -0.06]]
+    - [[0.0, 0.0, -0.06], [0.0, 0.0, -0.06]]
+
+observation:
+  object_:
+    object_pos_b: {}
+    object_ori_b: {}
+  object_geo_:
+    object_points: {}
+  depth:
+    depth_camera:
+      camera_name: tiled_camera
+      noise_std: 0.05
+      episode_noise_range: [-0.15, 0.15]
+      delay_range: [0, 4]
+      gaussian_filter_kernel_choices: [1, 3, 5]
+      gaussian_filter_sigma_range: [1.0, 1.5]
+  vel_command:
+    ref_root_vel_future_b: {}
+    ref_contact_flag_future: {}
+
+randomization:
+  object_joint_randomization:
+    armature_range: [0.0, 0.001]
+    friction_range: [0.0, 0.00003]
+    damping_range: [0.0, 0.00001]
+  object_body_randomization:
+    static_dynamic_friction_ratio_range: [1.0, 2.0]
+    dynamic_friction_range: [1.5, 3.0]
+    restitution_range: [0.0, 0.02]
+    mass_range: [1.0, 2.5]
+    wheel_mass_range: [0.050, 0.20]
+    wheel_dynamic_friction_range: [0.01, 0.1]
+    wheel_restitution_range: [0.0, 0.002]
+    wheel_static_dynamic_friction_ratio_range: [30.0, 60.0]
+  body_scale:
+    name: skateboard
+    scale_range: [0.8, 1.1]
+    homogeneous_scale: true
+
+camera_dr:
+  extrinsics_pos_noise_std: [0.01, 0.01, 0.01]
+  extrinsics_rot_noise_std: [0.01, 0.02, 0.01]
+  intrinsics_focal_length_noise_std: 0.02
+  intrinsics_aperture_noise_std: 0.05
+
+termination:
+  cum_object_pos_error: {min_steps: 5000}
+  cum_object_ori_error: {min_steps: 5000}
+
+reward:
+  feet:
+    impact_force_l2: {weight: 1.0, enabled: true, body_names: left_ankle_roll_link}
+    feet_slip: {weight: 0.5, tolerance: 0.0, enabled: true, body_names: left_ankle_roll_link}
+    feet_air_time_skateboard: {weight: 5.0, enabled: true, body_names: .*ankle_roll_link, thres: 0.2, soft_discount: 1.0}

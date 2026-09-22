@@ -11,7 +11,7 @@ app:
   headless: ${..headless}
   enable_cameras: ${oc.select:..task.enable_cameras,${..eval_render}}
 
-total_frames: 800_000_000
+total_frames: 2_400_000_000
 # total_frames: 500_000_000
 # total_frames: 300_000_000
 # total_frames: 150_000_000
@@ -27,7 +27,7 @@ camera_follow: true
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train
-  project: haic
+  project: vaic
   mode: online # set to 'disabled' when debugging locally
   tags: []
 

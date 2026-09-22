@@ -1,0 +1,387 @@
+{
+    "init_state": {
+        "pos": [
+            0.0,
+            0.0,
+            0.76
+        ],
+        "rot": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+        ],
+        "lin_vel": [
+            0.0,
+            0.0,
+            0.0
+        ],
+        "ang_vel": [
+            0.0,
+            0.0,
+            0.0
+        ],
+        "joint_pos": {
+            ".*_hip_pitch_joint": -0.312,
+            ".*_knee_joint": 0.669,
+            ".*_ankle_pitch_joint": -0.363,
+            ".*_elbow_joint": 0.6,
+            "left_shoulder_roll_joint": 0.2,
+            "left_shoulder_pitch_joint": 0.2,
+            "right_shoulder_roll_joint": -0.2,
+            "right_shoulder_pitch_joint": 0.2
+        },
+        "joint_vel": {
+            ".*": 0.0
+        }
+    },
+    "body_names_isaac": [
+        "pelvis",
+        "imu_in_pelvis",
+        "left_hip_pitch_link",
+        "pelvis_contour_link",
+        "right_hip_pitch_link",
+        "waist_yaw_link",
+        "left_hip_roll_link",
+        "right_hip_roll_link",
+        "waist_roll_link",
+        "left_hip_yaw_link",
+        "right_hip_yaw_link",
+        "torso_link",
+        "left_knee_link",
+        "right_knee_link",
+        "d435_link",
+        "head_link",
+        "imu_in_torso",
+        "left_shoulder_pitch_link",
+        "logo_link",
+        "mid360_link",
+        "right_shoulder_pitch_link",
+        "left_ankle_pitch_link",
+        "right_ankle_pitch_link",
+        "left_shoulder_roll_link",
+        "right_shoulder_roll_link",
+        "left_ankle_roll_link",
+        "right_ankle_roll_link",
+        "left_shoulder_yaw_link",
+        "right_shoulder_yaw_link",
+        "left_elbow_link",
+        "right_elbow_link",
+        "left_wrist_roll_link",
+        "right_wrist_roll_link",
+        "left_wrist_pitch_link",
+        "right_wrist_pitch_link",
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+        "left_rubber_hand",
+        "right_rubber_hand"
+    ],
+    "joint_names_isaac": [
+        "left_hip_pitch_joint",
+        "right_hip_pitch_joint",
+        "waist_yaw_joint",
+        "left_hip_roll_joint",
+        "right_hip_roll_joint",
+        "waist_roll_joint",
+        "left_hip_yaw_joint",
+        "right_hip_yaw_joint",
+        "waist_pitch_joint",
+        "left_knee_joint",
+        "right_knee_joint",
+        "left_shoulder_pitch_joint",
+        "right_shoulder_pitch_joint",
+        "left_ankle_pitch_joint",
+        "right_ankle_pitch_joint",
+        "left_shoulder_roll_joint",
+        "right_shoulder_roll_joint",
+        "left_ankle_roll_joint",
+        "right_ankle_roll_joint",
+        "left_shoulder_yaw_joint",
+        "right_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "right_elbow_joint",
+        "left_wrist_roll_joint",
+        "right_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "right_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "right_wrist_yaw_joint"
+    ],
+    "actuators": {
+        "legs": {
+            "class_type": "isaaclab.actuators.actuator_pd:ImplicitActuator",
+            "joint_names_expr": [
+                ".*_hip_yaw_joint",
+                ".*_hip_roll_joint",
+                ".*_hip_pitch_joint",
+                ".*_knee_joint"
+            ],
+            "effort_limit": {
+                ".*_hip_yaw_joint": 88.0,
+                ".*_hip_roll_joint": 139.0,
+                ".*_hip_pitch_joint": 88.0,
+                ".*_knee_joint": 139.0
+            },
+            "velocity_limit": {
+                ".*_hip_yaw_joint": 32.0,
+                ".*_hip_roll_joint": 20.0,
+                ".*_hip_pitch_joint": 32.0,
+                ".*_knee_joint": 20.0
+            },
+            "effort_limit_sim": {
+                ".*_hip_yaw_joint": 88.0,
+                ".*_hip_roll_joint": 139.0,
+                ".*_hip_pitch_joint": 88.0,
+                ".*_knee_joint": 139.0
+            },
+            "velocity_limit_sim": {
+                ".*_hip_yaw_joint": 32.0,
+                ".*_hip_roll_joint": 20.0,
+                ".*_hip_pitch_joint": 32.0,
+                ".*_knee_joint": 20.0
+            },
+            "stiffness": {
+                ".*_hip_pitch_joint": 40.17923847137318,
+                ".*_hip_roll_joint": 99.09842777666113,
+                ".*_hip_yaw_joint": 40.17923847137318,
+                ".*_knee_joint": 99.09842777666113
+            },
+            "damping": {
+                ".*_hip_pitch_joint": 2.5578897650279457,
+                ".*_hip_roll_joint": 6.3088018534966395,
+                ".*_hip_yaw_joint": 2.5578897650279457,
+                ".*_knee_joint": 6.3088018534966395
+            },
+            "armature": {
+                ".*_hip_pitch_joint": 0.01017752,
+                ".*_hip_roll_joint": 0.025101925,
+                ".*_hip_yaw_joint": 0.01017752,
+                ".*_knee_joint": 0.025101925
+            },
+            "friction": null,
+            "dynamic_friction": null,
+            "viscous_friction": null
+        },
+        "feet": {
+            "class_type": "isaaclab.actuators.actuator_pd:ImplicitActuator",
+            "joint_names_expr": [
+                ".*_ankle_pitch_joint",
+                ".*_ankle_roll_joint"
+            ],
+            "effort_limit": 50.0,
+            "velocity_limit": 37.0,
+            "effort_limit_sim": 50.0,
+            "velocity_limit_sim": 37.0,
+            "stiffness": 28.50124619574858,
+            "damping": 1.814445686584846,
+            "armature": 0.00721945,
+            "friction": null,
+            "dynamic_friction": null,
+            "viscous_friction": null
+        },
+        "waist": {
+            "class_type": "isaaclab.actuators.actuator_pd:ImplicitActuator",
+            "joint_names_expr": [
+                "waist_roll_joint",
+                "waist_pitch_joint"
+            ],
+            "effort_limit": 50,
+            "velocity_limit": 37.0,
+            "effort_limit_sim": 50,
+            "velocity_limit_sim": 37.0,
+            "stiffness": 28.50124619574858,
+            "damping": 1.814445686584846,
+            "armature": 0.00721945,
+            "friction": null,
+            "dynamic_friction": null,
+            "viscous_friction": null
+        },
+        "waist_yaw": {
+            "class_type": "isaaclab.actuators.actuator_pd:ImplicitActuator",
+            "joint_names_expr": [
+                "waist_yaw_joint"
+            ],
+            "effort_limit": 88,
+            "velocity_limit": 32.0,
+            "effort_limit_sim": 88,
+            "velocity_limit_sim": 32.0,
+            "stiffness": 40.17923847137318,
+            "damping": 2.5578897650279457,
+            "armature": 0.01017752,
+            "friction": null,
+            "dynamic_friction": null,
+            "viscous_friction": null
+        },
+        "arms": {
+            "class_type": "isaaclab.actuators.actuator_pd:ImplicitActuator",
+            "joint_names_expr": [
+                ".*_shoulder_pitch_joint",
+                ".*_shoulder_roll_joint",
+                ".*_shoulder_yaw_joint",
+                ".*_elbow_joint",
+                ".*_wrist_roll_joint",
+                ".*_wrist_pitch_joint",
+                ".*_wrist_yaw_joint"
+            ],
+            "effort_limit": {
+                ".*_shoulder_pitch_joint": 25.0,
+                ".*_shoulder_roll_joint": 25.0,
+                ".*_shoulder_yaw_joint": 25.0,
+                ".*_elbow_joint": 25.0,
+                ".*_wrist_roll_joint": 25.0,
+                ".*_wrist_pitch_joint": 5.0,
+                ".*_wrist_yaw_joint": 5.0
+            },
+            "velocity_limit": {
+                ".*_shoulder_pitch_joint": 37.0,
+                ".*_shoulder_roll_joint": 37.0,
+                ".*_shoulder_yaw_joint": 37.0,
+                ".*_elbow_joint": 37.0,
+                ".*_wrist_roll_joint": 37.0,
+                ".*_wrist_pitch_joint": 22.0,
+                ".*_wrist_yaw_joint": 22.0
+            },
+            "effort_limit_sim": {
+                ".*_shoulder_pitch_joint": 25.0,
+                ".*_shoulder_roll_joint": 25.0,
+                ".*_shoulder_yaw_joint": 25.0,
+                ".*_elbow_joint": 25.0,
+                ".*_wrist_roll_joint": 25.0,
+                ".*_wrist_pitch_joint": 5.0,
+                ".*_wrist_yaw_joint": 5.0
+            },
+            "velocity_limit_sim": {
+                ".*_shoulder_pitch_joint": 37.0,
+                ".*_shoulder_roll_joint": 37.0,
+                ".*_shoulder_yaw_joint": 37.0,
+                ".*_elbow_joint": 37.0,
+                ".*_wrist_roll_joint": 37.0,
+                ".*_wrist_pitch_joint": 22.0,
+                ".*_wrist_yaw_joint": 22.0
+            },
+            "stiffness": {
+                ".*_shoulder_pitch_joint": 14.25062309787429,
+                ".*_shoulder_roll_joint": 14.25062309787429,
+                ".*_shoulder_yaw_joint": 14.25062309787429,
+                ".*_elbow_joint": 14.25062309787429,
+                ".*_wrist_roll_joint": 14.25062309787429,
+                ".*_wrist_pitch_joint": 16.77832748089279,
+                ".*_wrist_yaw_joint": 16.77832748089279
+            },
+            "damping": {
+                ".*_shoulder_pitch_joint": 0.907222843292423,
+                ".*_shoulder_roll_joint": 0.907222843292423,
+                ".*_shoulder_yaw_joint": 0.907222843292423,
+                ".*_elbow_joint": 0.907222843292423,
+                ".*_wrist_roll_joint": 0.907222843292423,
+                ".*_wrist_pitch_joint": 1.06814150219,
+                ".*_wrist_yaw_joint": 1.06814150219
+            },
+            "armature": {
+                ".*_shoulder_pitch_joint": 0.003609725,
+                ".*_shoulder_roll_joint": 0.003609725,
+                ".*_shoulder_yaw_joint": 0.003609725,
+                ".*_elbow_joint": 0.003609725,
+                ".*_wrist_roll_joint": 0.003609725,
+                ".*_wrist_pitch_joint": 0.00425,
+                ".*_wrist_yaw_joint": 0.00425
+            },
+            "friction": null,
+            "dynamic_friction": null,
+            "viscous_friction": null
+        }
+    },
+    "default_joint_pos": [
+        -0.31200000643730164,
+        -0.31200000643730164,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.6690000295639038,
+        0.6690000295639038,
+        0.20000000298023224,
+        0.20000000298023224,
+        -0.3630000054836273,
+        -0.3630000054836273,
+        0.20000000298023224,
+        -0.20000000298023224,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.6000000238418579,
+        0.6000000238418579,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+    ],
+    "stiffness": [
+        40.179237365722656,
+        40.179237365722656,
+        40.179237365722656,
+        99.09842681884766,
+        99.09842681884766,
+        28.501245498657227,
+        40.179237365722656,
+        40.179237365722656,
+        28.501245498657227,
+        99.09842681884766,
+        99.09842681884766,
+        14.250622749328613,
+        14.250622749328613,
+        28.501245498657227,
+        28.501245498657227,
+        14.250622749328613,
+        14.250622749328613,
+        28.501245498657227,
+        28.501245498657227,
+        14.250622749328613,
+        14.250622749328613,
+        14.250622749328613,
+        14.250622749328613,
+        14.250622749328613,
+        14.250622749328613,
+        16.77832794189453,
+        16.77832794189453,
+        16.77832794189453,
+        16.77832794189453
+    ],
+    "damping": [
+        2.557889699935913,
+        2.557889699935913,
+        2.557889699935913,
+        6.308801651000977,
+        6.308801651000977,
+        1.8144457340240479,
+        2.557889699935913,
+        2.557889699935913,
+        1.8144457340240479,
+        6.308801651000977,
+        6.308801651000977,
+        0.9072228670120239,
+        0.9072228670120239,
+        1.8144457340240479,
+        1.8144457340240479,
+        0.9072228670120239,
+        0.9072228670120239,
+        1.8144457340240479,
+        1.8144457340240479,
+        0.9072228670120239,
+        0.9072228670120239,
+        0.9072228670120239,
+        0.9072228670120239,
+        0.9072228670120239,
+        0.9072228670120239,
+        1.0681414604187012,
+        1.0681414604187012,
+        1.0681414604187012,
+        1.0681414604187012
+    ]
+}

@@ -72,6 +72,18 @@ python scripts/play.py algo=ppo_vel_finetune task=G1/vaic/skateboard_stu checkpo
 ```
 To export trained policies, add `export_policy=true` to the play script.
 
+GPO training with the CTS guider/learner architecture:
+
+```bash
+python scripts/train.py \
+  algo=gpo_ppo_vel_train \
+  task=G1/gpo/skateboard_general_tracking
+```
+
+The default is GPO-clip: all environments execute the guider, and the learner's
+depth/object/GRU perception is trained jointly through the GPO objective.
+See [GPO settings, checkpoint resume and verification](active_adaptation/learning/gpo/README.md).
+
 
 ## Acknowledgments
 
