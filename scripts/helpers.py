@@ -181,9 +181,10 @@ def make_env_policy(cfg: DictConfig):
     
     if hasattr(policy, "make_tensordict_primer"):
         primer = policy.make_tensordict_primer()
-        print(colored(f"[Info]: Add TensorDictPrimer {primer}.", "green"))
-        transform.append(primer)
-        env = TransformedEnv(env.base_env, transform)
+        if primer is not None:
+            print(colored(f"[Info]: Add TensorDictPrimer {primer}.", "green"))
+            transform.append(primer)
+            env = TransformedEnv(env.base_env, transform)
     env: _Env
 
     return env, policy, vecnorm
@@ -376,4 +377,3 @@ def plot_obs_histogram(
     plt.tight_layout()
     plt.savefig(os.path.join(os.path.dirname(__file__), "trajs_obs_hist.png"))
     plt.close()
-    

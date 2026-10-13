@@ -1,104 +1,169 @@
-"""Gated visual/proprioceptive belief used by the joint FlashSAC student.
+"""Small depth CNN and finite causal-window Transformer for FlashSAC.
 
-Only the supervised latent/object objective trains this module. The actor consumes
-detached predictions. Object geometry is the fixed object-frame template, never a
-point cloud transformed by a ground-truth pose.
+Frames are encoded once per sampled chunk. Independent windows prevent information
+outside the configured history (or across an episode boundary) from reaching a
+prediction, even with multiple attention layers. Only supervised losses train it.
 """
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
-from ..ppo.common import make_conv, make_mlp
+from ..ppo.common import FlattenBatch, make_mlp
+from .one_stage_replay import encode_depth, decode_depth
 
 
-class GatedBeliefPerception(nn.Module):
-    def __init__(self, context_dim, depth_shape, object_dim, geometry,
-                 latent_dim=256, hidden_dim=256, depth_feature_dim=64):
+class CausalWindowBlock(nn.Module):
+    def __init__(self, model_dim, num_heads, ffn_dim):
         super().__init__()
-        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.norm_attention = nn.LayerNorm(model_dim)
+        self.qkv = nn.Linear(model_dim, 3 * model_dim)
+        self.projection = nn.Linear(model_dim, model_dim)
+        self.norm_ffn = nn.LayerNorm(model_dim)
+        self.ffn = nn.Sequential(nn.Linear(model_dim, ffn_dim), nn.GELU(),
+                                 nn.Linear(ffn_dim, model_dim))
+
+    def forward(self, x, valid, *, last_only=False):
+        batch, length, width = x.shape
+        q, k, v = self.qkv(self.norm_attention(x)).reshape(
+            batch, length, 3, self.num_heads, width // self.num_heads
+        ).permute(2, 0, 3, 1, 4).unbind(0)
+        if last_only:
+            q = q[:, :, -1:]
+            # Every valid key precedes this sole query. Give an invalid query a
+            # finite self-attention fallback; the final prediction is zeroed.
+            self_key = torch.arange(length, device=x.device) == length - 1
+            allowed = valid | (~valid[:, -1:] & self_key)
+            mask = allowed[:, None, None, :]
+            x = x[:, -1:]
+        else:
+            causal = torch.ones(length, length, dtype=torch.bool, device=x.device).tril()
+            diagonal = torch.eye(length, dtype=torch.bool, device=x.device)
+            mask = (valid[:, None, :] & causal) | (~valid[:, :, None] & diagonal)
+            mask = mask[:, None]
+        attention = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.)
+        x = x + self.projection(attention.transpose(1, 2).reshape(batch, x.shape[1], width))
+        return x + self.ffn(self.norm_ffn(x))
+
+
+class WindowTransformerPerception(nn.Module):
+    def __init__(self, context_dim, depth_shape, object_dim, geometry,
+                 latent_dim=256, window_size=16, model_dim=128, num_layers=1,
+                 num_heads=4, ffn_dim=256, depth_feature_dim=64):
+        super().__init__()
+        if min(window_size, model_dim, num_layers, num_heads, ffn_dim) < 1:
+            raise ValueError("Transformer dimensions and window_size must be positive")
+        if model_dim % num_heads:
+            raise ValueError("perception_model_dim must be divisible by perception_num_heads")
+        self.window_size = window_size
+        self.model_dim = model_dim
         self.latent_dim = latent_dim
         self.depth_shape = tuple(depth_shape)
+        self.context_dim = context_dim
         self.register_buffer("geometry", geometry.detach().float().flatten().clone())
         self.depth_cnn = nn.Sequential(
-            make_conv([8, 8, 8], activation=nn.Mish, kernel_sizes=5),
+            FlattenBatch(nn.Sequential(
+                nn.Conv2d(depth_shape[0], 8, 5, stride=4, padding=2), nn.Mish(),
+                nn.Conv2d(8, 8, 3, stride=2, padding=1), nn.Mish(), nn.Flatten(),
+            ), data_dim=3),
             nn.LazyLinear(depth_feature_dim), nn.LayerNorm(depth_feature_dim),
         )
-        self.visual = nn.Linear(depth_feature_dim, hidden_dim)
-        self.context = make_mlp([hidden_dim, hidden_dim])
-        self.gate = nn.Linear(3 * hidden_dim, hidden_dim)
-        self.gru = nn.GRUCell(2 * hidden_dim, hidden_dim)
-        self.object_head = nn.Linear(hidden_dim, object_dim)
-        self.priv_head = nn.Linear(hidden_dim, latent_dim)
-        # Begin near an open/closed balance; avoid starving the visual branch.
-        nn.init.xavier_uniform_(self.gate.weight, gain=0.1)
-        nn.init.zeros_(self.gate.bias)
+        self.visual = nn.Linear(depth_feature_dim, 256)
+        self.context = make_mlp([256, 256])
+        self.token = nn.Linear(512, model_dim)
+        self.position = nn.Parameter(torch.randn(1, window_size, model_dim) * .02)
+        self.blocks = nn.ModuleList([
+            CausalWindowBlock(model_dim, num_heads, ffn_dim) for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(model_dim)
+        self.object_head = nn.Linear(model_dim, object_dim)
+        self.priv_head = nn.Linear(model_dim, latent_dim)
         self.to(geometry.device)
         with torch.no_grad():
             self.encode(torch.zeros(2, *depth_shape, device=geometry.device),
                         torch.zeros(2, context_dim, device=geometry.device))
 
     def encode(self, depth, context):
-        """Batch the image/context encoders independently of the recurrent loop."""
         geometry = self.geometry.expand(*context.shape[:-1], -1)
         p = self.context(torch.cat([context, geometry], -1))
         v = self.visual(self.depth_cnn(depth))
-        return p, v
+        return self.token(torch.cat([p, v], -1))
 
-    def step(self, p, v, hidden, is_init, valid=None):
-        # The previous episode must not affect even the visual gate.
-        reset = is_init.reshape(*hidden.shape[:-1], 1).bool()
-        if valid is not None:
-            reset = reset | ~valid.reshape_as(reset).bool()
-        hidden = torch.where(reset, torch.zeros_like(hidden), hidden)
-        gate = torch.sigmoid(self.gate(torch.cat([p, v, hidden], -1)))
-        hidden = self.gru(torch.cat([p, gate * v], -1), hidden)
-        if valid is not None:
-            hidden = torch.where(valid.reshape_as(reset).bool(), hidden, 0.)
-        return self.priv_head(hidden), self.object_head(hidden), hidden, gate
+    @staticmethod
+    def window_valid(is_init, valid):
+        """Only valid frames in the final query's episode may supply keys."""
+        episode = (is_init.bool() | ~valid.bool()).long().cumsum(-1)
+        return valid.bool() & (episode == episode[..., -1:])
 
-    def forward(self, depth, context, hidden, is_init, valid=None):
-        return self.step(*self.encode(depth, context), hidden, is_init, valid)
+    def window(self, tokens, valid):
+        """Predict the final frame from [batch,L,D] independent windows."""
+        if tokens.shape[1] != self.window_size:
+            raise ValueError("perception window has the wrong length")
+        x = torch.where(valid.unsqueeze(-1), tokens, 0.) + self.position
+        for index, block in enumerate(self.blocks):
+            x = block(x, valid, last_only=index == len(self.blocks) - 1)
+        x = self.norm(x[:, -1])
+        current_valid = valid[:, -1:]
+        return (torch.where(current_valid, self.priv_head(x), 0.),
+                torch.where(current_valid, self.object_head(x), 0.))
 
-    def sequence(self, depth, context, hidden, is_init, valid, learning_start=None):
-        """Unroll [batch,time,...], optionally truncating gradients at each burn-in.
+    def forward(self, depth, context, is_init, valid):
+        return self.window(self.encode(depth, context), self.window_valid(is_init, valid))
 
-        learning_start=None computes the whole sequence in the caller's grad mode.
-        Otherwise the common prefix is encoded without a backward graph, and each
-        row's hidden is detached until its own learning window begins. A saved
-        old-weight hidden followed by burn-in remains an approximation.
-        """
-        prefix = 0 if learning_start is None else int(learning_start.min())
-        contexts, visuals = [], []
-        if prefix:
-            with torch.no_grad():
-                p, v = self.encode(depth[:, :prefix], context[:, :prefix])
-            contexts.append(p)
-            visuals.append(v)
-        if prefix < depth.shape[1]:
-            p, v = self.encode(depth[:, prefix:], context[:, prefix:])
-            contexts.append(p)
-            visuals.append(v)
-        p, v = torch.cat(contexts, 1), torch.cat(visuals, 1)
-        latents, objects, states, gates = [], [], [], []
-        for t in range(depth.shape[1]):
-            if t < prefix:
-                with torch.no_grad():
-                    z, obj, hidden, gate = self.step(p[:, t], v[:, t], hidden,
-                                                    is_init[:, t], valid[:, t])
-            else:
-                if learning_start is not None:
-                    learning = (t >= learning_start).unsqueeze(-1)
-                    hidden = torch.where(learning, hidden, hidden.detach())
-                    pt = torch.where(learning, p[:, t], p[:, t].detach())
-                    vt = torch.where(learning, v[:, t], v[:, t].detach())
-                else:
-                    learning, pt, vt = None, p[:, t], v[:, t]
-                z, obj, hidden, gate = self.step(pt, vt, hidden,
-                                                is_init[:, t], valid[:, t])
-                if learning is not None:
-                    hidden = torch.where(learning, hidden, hidden.detach())
-            latents.append(z)
-            objects.append(obj)
-            states.append(hidden)
-            gates.append(gate)
-        return tuple(torch.stack(values, 1) for values in (latents, objects, states, gates))
+    def sequence_from_tokens(self, tokens, is_init, valid):
+        """Return predictions for indices L-1..T-1, with exact L-frame context."""
+        length = self.window_size
+        if tokens.shape[1] < length:
+            raise ValueError("sequence must contain at least one full perception window")
+        windows = tokens.unfold(1, length, 1).permute(0, 1, 3, 2)
+        batch, count, _, width = windows.shape
+        # Compute episode IDs once, before extracting overlapping windows.
+        episode = (is_init.bool() | ~valid.bool()).long().cumsum(-1)
+        episodes = episode.unfold(1, length, 1)
+        keep = valid.unfold(1, length, 1) & (episodes == episodes[..., -1:])
+        z, objects = self.window(windows.reshape(batch * count, length, width),
+                                 keep.reshape(batch * count, length))
+        return z.reshape(batch, count, -1), objects.reshape(batch, count, -1)
+
+    def sequence(self, depth, context, is_init, valid):
+        return self.sequence_from_tokens(self.encode(depth, context), is_init, valid)
+
+
+class WindowHistory:
+    """Online raw-frame ring with versioned CNN tokens, never recurrent state.
+
+    A perception optimizer step invalidates all tokens. The next rollout rebuilds
+    them from retained raw frames, so a window always uses one set of weights.
+    """
+    def __init__(self, perception, batch_size, num_depth_bins):
+        device = perception.geometry.device
+        length = perception.window_size
+        self.num_depth_bins = num_depth_bins
+        self.depth = torch.zeros(batch_size, length, *perception.depth_shape,
+                                 dtype=torch.uint8, device=device)
+        self.context = torch.zeros(batch_size, length, perception.context_dim, device=device)
+        self.tokens = torch.zeros(batch_size, length, perception.model_dim, device=device)
+        self.valid = torch.zeros(batch_size, length, dtype=torch.bool, device=device)
+        offsets = torch.arange(length, device=device)
+        self.orders = (offsets[:, None] + 1 + offsets[None]) % length
+        self.cursor = 0
+        self.version = -1
+
+    @torch.no_grad()
+    def step(self, perception, depth, context, is_init, valid, version):
+        reset = is_init.reshape(-1).bool() | ~valid.reshape(-1).bool()
+        self.valid &= ~reset[:, None]
+        index = self.cursor
+        self.depth[:, index].copy_(encode_depth(depth, self.num_depth_bins))
+        self.context[:, index].copy_(context)
+        self.valid[:, index].copy_(valid.reshape(-1))
+        if self.version != version:
+            self.tokens.copy_(perception.encode(decode_depth(self.depth, self.num_depth_bins), self.context))
+            self.version = version
+        else:
+            self.tokens[:, index].copy_(perception.encode(
+                decode_depth(self.depth[:, index], self.num_depth_bins), self.context[:, index]))
+        order = self.orders[index]
+        self.cursor = (index + 1) % perception.window_size
+        return perception.window(self.tokens.index_select(1, order), self.valid.index_select(1, order))

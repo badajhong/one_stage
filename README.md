@@ -92,6 +92,11 @@ python scripts/train.py \
   task=G1/flashsac/skateboard_general_tracking
 ```
 
+The default student perception is a small two-layer CNN plus a causal window
+Transformer (`L=16`, dimension `128`, one layer, four heads). Replay stores raw
+frames; GRU hidden checkpoints and burn-in are removed. This architecture starts
+fresh and only resumes checkpoints produced by the new window model.
+
 Teacher latent pull loss is enabled by default with a maximum weight of `0.001`,
 perception warm-up, a linear ramp, and a gradient norm cap. Disable it with
 `algo.teacher_pull_enabled=false`. See the
@@ -122,7 +127,7 @@ python scripts/train.py \
 
 The full defaults use 4096 environments and a 10-million-transition CPU replay
 buffer. Adjust `algo.num_envs` and `algo.buffer_max_length` for available RAM;
-the replay must hold at least 81 steps per environment with the default history
+the replay must hold at least 50 steps per environment with the default history
 settings. See [FlashSAC settings](active_adaptation/learning/flashsac/README.md).
 
 

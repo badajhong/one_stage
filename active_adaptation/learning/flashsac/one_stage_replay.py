@@ -1,12 +1,11 @@
-"""Sequence replay for a jointly trained teacher and recurrent visual student.
+"""Window replay for a jointly trained teacher and visual student.
 
 Current observations are stored once, in environment/time order.  Only episode
 endpoints need an extra next observation: the following environment observation
 can already belong to a reset episode (or be a reset placeholder).
 
-Hidden checkpoints are incoming rollout states, not exact states of the current
-perception model.  Replaying the burn-in with current weights mitigates, but does
-not eliminate, that representation mismatch.
+Chunks include L-1 preceding raw frames. No learned hidden state or latent is
+stored, so each sampled window is encoded with the current perception weights.
 
 This module deliberately depends only on PyTorch and the standard library so its
 replay semantics can be tested without a simulator or the FlashSAC dependency.
@@ -42,13 +41,13 @@ def decode_depth(depth: torch.Tensor, num_bins: int = 100) -> torch.Tensor:
 
 
 @dataclass
-class ReplaySequenceBatch:
+class ReplayWindowBatch:
     """A balanced collection of chunks, with batch-major sequence tensors.
 
     ``indices`` selects the learning observations from ``obs``.  A nonterminal
     ``bootstrap_index`` selects the bootstrap observation.  A terminal index
-    selects the *last action's current observation*: process ``terminal_obs``
-    from the hidden AFTER that index, before any reset, to obtain its belief.
+    selects the *last action's current observation*: append ``terminal_obs``
+    to the L-1 frames ending at that index, before any reset, for the final latent.
     ``bootstrap_discount`` already contains gamma to the actual horizon power.
 
     ``sample_weight`` sums to one, with one half assigned to each rollout source
@@ -60,11 +59,8 @@ class ReplaySequenceBatch:
     depth: torch.Tensor
     is_init: torch.Tensor
     valid: torch.Tensor
-    h0: torch.Tensor
-    checkpoint_step: torch.Tensor
-    checkpoint_version: torch.Tensor
+    start_step: torch.Tensor
     source: torch.Tensor
-    learning_start: torch.Tensor
     indices: torch.Tensor
     actions: torch.Tensor
     learning_mask: torch.Tensor
@@ -78,7 +74,7 @@ class ReplaySequenceBatch:
 
     def to(self, device, non_blocking: bool = False):
         # Transfer depth in its compact form and let the learner decode on GPU.
-        float_fields = {"obs", "terminal_obs", "h0"}
+        float_fields = {"obs", "terminal_obs"}
         return type(self)(**{
             field.name: getattr(self, field.name).to(
                 device=device,
@@ -96,17 +92,11 @@ class _TerminalRecord:
     depth: torch.Tensor
 
 
-class OneStageSequenceReplay:
-    """FIFO replay with sparse belief checkpoints and source-balanced chunks.
+class OneStageWindowReplay:
+    """FIFO raw-frame replay with source-balanced learning chunks.
 
-    ``capacity`` is a requested transition count, rounded down to complete rows
-    of ``num_envs``. Environment indices ``[0, num_envs // 2)`` are the teacher
-    source and the remaining indices are the student source.
-
-    For interval=16, burn_in=16, sequence_length=32 and n_step=3, sampled chunks
-    contain 66 observations. Their learning start is 16--31 observations after
-    a checkpoint. The trailing observations supply n-step bootstrap states.
-    Replay must hold at least 81 rows to allow this sampling after ring wrap.
+    The preceding window_size-1 frames and following n_step frames surround each
+    sequence_length learning chunk. Capacity is rounded down to full env rows.
     """
 
     def __init__(
@@ -116,9 +106,7 @@ class OneStageSequenceReplay:
         obs_dim: int,
         action_dim: int,
         depth_shape: Sequence[int],
-        hidden_dim: int = 256,
-        checkpoint_interval: int = 16,
-        burn_in: int = 16,
+        window_size: int = 16,
         sequence_length: int = 32,
         n_step: int = 3,
         gamma: float = 0.99,
@@ -132,10 +120,10 @@ class OneStageSequenceReplay:
     ):
         if num_envs < 2 or num_envs % 2:
             raise ValueError("num_envs must be positive and even for 50:50 rollout sources")
-        if checkpoint_interval < 1 or burn_in < 0 or sequence_length < 1 or n_step < 1:
-            raise ValueError("Invalid checkpoint, burn-in, sequence, or n-step length")
-        if hidden_dim < 1 or obs_dim < 1 or action_dim < 1:
-            raise ValueError("Observation, action, and hidden dimensions must be positive")
+        if window_size < 1 or sequence_length < 1 or n_step < 1:
+            raise ValueError("Invalid window, sequence, or n-step length")
+        if obs_dim < 1 or action_dim < 1:
+            raise ValueError("Observation and action dimensions must be positive")
         if not 0.0 <= gamma <= 1.0:
             raise ValueError("gamma must be between zero and one")
         if not 1 <= num_depth_bins <= 255:
@@ -150,9 +138,7 @@ class OneStageSequenceReplay:
         self.depth_shape = tuple(int(x) for x in depth_shape)
         if not self.depth_shape or any(x < 1 for x in self.depth_shape):
             raise ValueError("depth_shape must contain positive dimensions")
-        self.hidden_dim = int(hidden_dim)
-        self.checkpoint_interval = int(checkpoint_interval)
-        self.burn_in = int(burn_in)
+        self.window_size = int(window_size)
         self.sequence_length = int(sequence_length)
         self.n_step = int(n_step)
         self.gamma = float(gamma)
@@ -163,16 +149,15 @@ class OneStageSequenceReplay:
         self.batch_size = int(batch_size)
         self.min_length = int(min_length)
         self.total_sequence_length = (
-            self.burn_in + self.checkpoint_interval - 1 + self.sequence_length + self.n_step
+            self.window_size - 1 + self.sequence_length + self.n_step
         )
         self.T = int(capacity) // self.num_envs
-        minimum_rows = self.total_sequence_length + self.checkpoint_interval - 1
+        minimum_rows = self.total_sequence_length
         if self.T < minimum_rows:
             raise ValueError(
                 f"Replay capacity must hold at least {minimum_rows} steps per environment "
                 f"({minimum_rows * self.num_envs} transitions) for the requested chunk layout"
             )
-        self._checkpoint_rows = math.ceil(self.T / self.checkpoint_interval) + 1
         self.step = 0
         self._terminal_next = {}
         required = self.estimated_nbytes()
@@ -193,16 +178,6 @@ class OneStageSequenceReplay:
         # T+1 boundaries are needed to retain the prefix immediately before the
         # oldest row as well as the boundary after the newest row on ring wrap.
         self._valid_prefix = torch.zeros((self.T + 1, 2), dtype=torch.int64, device=self.storage)
-        self.checkpoint_hidden = torch.empty(
-            self._checkpoint_rows, self.num_envs, self.hidden_dim,
-            dtype=torch.float16, device=self.storage,
-        )
-        self.checkpoint_steps = torch.full(
-            (self._checkpoint_rows,), -1, dtype=torch.int64, device=self.storage
-        )
-        self.checkpoint_versions = torch.zeros(
-            (self._checkpoint_rows,), dtype=torch.int64, device=self.storage
-        )
 
     @property
     def capacity(self) -> int:
@@ -215,10 +190,7 @@ class OneStageSequenceReplay:
             self.obs_dim * obs_bytes + math.prod(self.depth_shape)
             + self.action_dim * 4 + 2 * 4 + 4
         )
-        return (
-            self.capacity * row_bytes + self.T * 8 + (self.T + 1) * 2 * 8
-            + self._checkpoint_rows * (self.num_envs * self.hidden_dim * 2 + 16)
-        )
+        return self.capacity * row_bytes + self.T * 8 + (self.T + 1) * 2 * 8
 
     def nbytes(self) -> int:
         """Allocated tensor payload, including retained final observations."""
@@ -264,8 +236,8 @@ class OneStageSequenceReplay:
 
     def _anchor_bounds(self):
         oldest = max(0, self.step - self.T)
-        first = (oldest + self.checkpoint_interval - 1) // self.checkpoint_interval
-        last = (self.step - self.total_sequence_length) // self.checkpoint_interval
+        first = oldest
+        last = self.step - self.total_sequence_length
         return first, last
 
     def can_sample(self, min_length: Optional[int] = None) -> bool:
@@ -274,20 +246,19 @@ class OneStageSequenceReplay:
             return False
         # Avoid accepting a buffer containing only reset placeholders. Sampling
         # performs a more precise per-chunk check, with a bounded rejection loop.
-        start = first * self.checkpoint_interval + self.burn_in
-        end = last * self.checkpoint_interval + self.total_sequence_length - self.n_step
+        start = first + self.window_size - 1
+        end = last + self.total_sequence_length - self.n_step
         counts = self._valid_prefix[end % (self.T + 1)] - self._valid_prefix[start % (self.T + 1)]
         return bool((counts > 0).all())
 
     @torch.no_grad()
     def add(
-        self, obs, depth, h_pre, is_init, action, reward, discount, done, cut,
-        valid, next_obs, next_depth, version: int = 0,
+        self, obs, depth, is_init, action, reward, discount, done, cut,
+        valid, next_obs, next_depth,
     ):
         """Append one actual transition per environment (including invalid rows).
 
-        ``h_pre`` is the belief *before* the current observation. ``is_init``
-        resets that belief before processing the observation. ``valid=False``
+        ``is_init`` starts a new window history. ``valid=False``
         denotes reset placeholders, and excludes any n-step target traversing
         that row. ``discount`` is the environment's soft continuation factor;
         gamma is applied by this replay. ``done`` stops the return; ``cut`` also
@@ -300,8 +271,6 @@ class OneStageSequenceReplay:
             raise ValueError("depth has the wrong shape")
         if tuple(next_depth.shape) != tuple(depth.shape):
             raise ValueError("next_depth has the wrong shape")
-        if tuple(h_pre.shape) != (self.num_envs, self.hidden_dim):
-            raise ValueError("h_pre must be [num_envs, hidden_dim]")
         if tuple(action.shape) != (self.num_envs, self.action_dim):
             raise ValueError("action has the wrong shape")
         g = self.step
@@ -322,11 +291,6 @@ class OneStageSequenceReplay:
         self._valid_prefix[(g + 1) % (self.T + 1)] = (
             self._valid_prefix[g % (self.T + 1)] + counts
         )
-        if g % self.checkpoint_interval == 0:
-            slot = (g // self.checkpoint_interval) % self._checkpoint_rows
-            self.checkpoint_hidden[slot].copy_(h_pre)
-            self.checkpoint_steps[slot] = g
-            self.checkpoint_versions[slot] = int(version)
         # Gather on the source device before transferring, so normal next frames
         # do not consume either replay RAM or CPU/GPU transfer bandwidth.
         done_ids = done.reshape(-1).bool().nonzero(as_tuple=False).flatten()
@@ -342,10 +306,10 @@ class OneStageSequenceReplay:
             )
         self.step += 1
 
-    def _learning_masks(self, checkpoints, envs, offsets):
-        starts = self.burn_in + offsets
-        indices = starts[:, None] + torch.arange(self.sequence_length, device=self.storage)
-        absolute = checkpoints[:, None] + indices
+    def _learning_masks(self, anchors, envs):
+        indices = (self.window_size - 1 + torch.arange(self.sequence_length, device=self.storage))
+        indices = indices.expand(anchors.numel(), -1)
+        absolute = anchors[:, None] + indices
         env_grid = envs[:, None].expand_as(indices)
         mask = self.valid[absolute % self.T, env_grid].clone()
         alive = torch.ones_like(mask)
@@ -360,10 +324,10 @@ class OneStageSequenceReplay:
             alive &= ~(self.done[at, env_grid] | self.cut[at, env_grid])
         nxt = (absolute + self.n_step) % self.T
         mask &= ~alive | (self.valid[nxt, env_grid] & ~self.is_init[nxt, env_grid])
-        return starts, indices, mask
+        return indices, mask
 
     @torch.no_grad()
-    def sample(self, batch_size: Optional[int] = None) -> ReplaySequenceBatch:
+    def sample(self, batch_size: Optional[int] = None) -> ReplayWindowBatch:
         count = self.batch_size if batch_size is None else int(batch_size)
         if count < 2 or count % 2:
             raise ValueError("sample batch_size must be an even number of chunks")
@@ -375,58 +339,42 @@ class OneStageSequenceReplay:
         half = self.num_envs // 2
         source = torch.arange(count, device=self.storage) // (count // 2)
         envs = torch.empty(count, dtype=torch.int64, device=self.storage)
-        checkpoints = torch.empty_like(envs)
-        offsets = torch.empty_like(envs)
+        anchors = torch.empty_like(envs)
         pending = torch.arange(count, device=self.storage)
         for _ in range(64):
             size = pending.numel()
             if not size:
                 break
             envs[pending] = torch.randint(half, (size,), device=self.storage) + source[pending] * half
-            checkpoints[pending] = torch.randint(first, last + 1, (size,), device=self.storage) * self.checkpoint_interval
-            offsets[pending] = torch.randint(self.checkpoint_interval, (size,), device=self.storage)
-            _, _, mask = self._learning_masks(checkpoints[pending], envs[pending], offsets[pending])
+            anchors[pending] = torch.randint(first, last + 1, (size,), device=self.storage)
+            _, mask = self._learning_masks(anchors[pending], envs[pending])
             pending = pending[~mask.any(dim=1)]
         if pending.numel():
             raise RuntimeError(
                 "Could not sample valid teacher/student chunks after 64 attempts; "
                 "collect more valid transitions or inspect reset/valid flags"
             )
-        return self.gather(checkpoints, envs, offsets).to(self.device)
+        return self.gather(anchors, envs).to(self.device)
 
     @torch.no_grad()
-    def gather(self, checkpoint_steps, env_ids, learning_offsets=None) -> ReplaySequenceBatch:
-        """Deterministic chunk access using absolute (not ring) checkpoint steps."""
-        checkpoints = torch.as_tensor(checkpoint_steps, dtype=torch.int64, device=self.storage).reshape(-1)
+    def gather(self, start_steps, env_ids) -> ReplayWindowBatch:
+        """Deterministic access by absolute first-context-frame index."""
+        anchors = torch.as_tensor(start_steps, dtype=torch.int64, device=self.storage).reshape(-1)
         envs = torch.as_tensor(env_ids, dtype=torch.int64, device=self.storage).reshape(-1)
-        if learning_offsets is None:
-            offsets = torch.zeros_like(checkpoints)
-        else:
-            offsets = torch.as_tensor(learning_offsets, dtype=torch.int64, device=self.storage).reshape(-1)
-        if checkpoints.numel() == 0 or envs.shape != checkpoints.shape or offsets.shape != checkpoints.shape:
-            raise ValueError("checkpoints, env_ids, and learning_offsets need equal nonzero lengths")
+        if anchors.numel() == 0 or envs.shape != anchors.shape:
+            raise ValueError("start_steps and env_ids need equal nonzero lengths")
         if bool(((envs < 0) | (envs >= self.num_envs)).any()):
             raise ValueError("Invalid environment index")
-        if bool(((offsets < 0) | (offsets >= self.checkpoint_interval)).any()):
-            raise ValueError("learning_offsets must be less than checkpoint_interval")
         first, last = self._anchor_bounds()
-        valid_anchors = (
-            (checkpoints % self.checkpoint_interval == 0)
-            & (checkpoints >= first * self.checkpoint_interval)
-            & (checkpoints <= last * self.checkpoint_interval)
-        )
-        if not bool(valid_anchors.all()):
-            raise ValueError("Checkpoint is overwritten, unaligned, or has incomplete future observations")
-        checkpoint_slots = (checkpoints // self.checkpoint_interval) % self._checkpoint_rows
-        if not bool((self.checkpoint_steps[checkpoint_slots] == checkpoints).all()):
-            raise RuntimeError("Hidden checkpoint no longer matches the requested observations")
-        absolute = checkpoints[:, None] + torch.arange(self.total_sequence_length, device=self.storage)
+        if not bool(((anchors >= first) & (anchors <= last)).all()):
+            raise ValueError("Window is overwritten or has incomplete future observations")
+        absolute = anchors[:, None] + torch.arange(self.total_sequence_length, device=self.storage)
         rows = absolute % self.T
         if not bool((self.row_step[rows] == absolute).all()):
             raise RuntimeError("Sequence contains an overwritten or missing replay row")
         env_grid = envs[:, None].expand_as(rows)
-        starts, indices, mask = self._learning_masks(checkpoints, envs, offsets)
-        learning_abs = checkpoints[:, None] + indices
+        indices, mask = self._learning_masks(anchors, envs)
+        learning_abs = anchors[:, None] + indices
         learning_env = envs[:, None].expand_as(indices)
         reward = torch.zeros_like(indices, dtype=torch.float32)
         scale = torch.ones_like(reward)
@@ -476,12 +424,10 @@ class OneStageSequenceReplay:
         for s in present:
             selected = mask & (source[:, None] == s)
             weights[selected] = 1.0 / (len(present) * selected.sum())
-        return ReplaySequenceBatch(
+        return ReplayWindowBatch(
             obs=self.obs[rows, env_grid], depth=self.depth[rows, env_grid],
             is_init=self.is_init[rows, env_grid], valid=self.valid[rows, env_grid],
-            h0=self.checkpoint_hidden[checkpoint_slots, envs],
-            checkpoint_step=checkpoints, checkpoint_version=self.checkpoint_versions[checkpoint_slots],
-            source=source, learning_start=starts, indices=indices,
+            start_step=anchors, source=source, indices=indices,
             actions=self.action[learning_abs % self.T, learning_env], learning_mask=mask,
             nstep_reward=reward.unsqueeze(-1), bootstrap_discount=bootstrap_discount.unsqueeze(-1),
             bootstrap_index=bootstrap_index, terminal_mask=terminal_mask,

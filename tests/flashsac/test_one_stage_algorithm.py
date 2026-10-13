@@ -1,7 +1,6 @@
 """End-to-end CPU joint learner tests with real networks and a small fake env."""
 
 import copy
-from dataclasses import fields
 import io
 import os
 from types import SimpleNamespace
@@ -14,9 +13,8 @@ import pytest
 from tensordict import TensorDict
 from torchrl.data import Composite, Unbounded
 
-from active_adaptation.learning.flashsac.flashsac_vel import FlashSACVel, FlashSACVelConfig
 from active_adaptation.learning.flashsac.one_stage_flashsac_vel import (
-    BELIEF_KEY, OneStageFlashSACVel, OneStageFlashSACVelConfig,
+    OneStageFlashSACVel, OneStageFlashSACVelConfig,
 )
 from active_adaptation.learning.flashsac.one_stage_update import _teacher_pull_loss
 
@@ -64,7 +62,6 @@ class FakeEnv:
         td["depth"] = torch.randint(101, (4, 1, 32, 64)).float() / 100
         td["is_init"] = torch.zeros(4, 1, dtype=torch.bool)
         td["step_count"] = torch.full((4, 1), 3, dtype=torch.long)
-        td[BELIEF_KEY] = torch.zeros(4, 16)
         return td
 
 
@@ -73,11 +70,11 @@ def make_policy(**options):
     env = FakeEnv()
     settings = dict(
         num_envs=4, num_env_steps=4096, train_every=4, sample_batch_size=16,
-        sequence_length=4, checkpoint_interval=2, burn_in=2, n_step=2,
+        sequence_length=4, perception_window_size=3, n_step=2,
         buffer_min_length=0, buffer_max_length=256, updates_per_interaction_step=.25,
         actor_num_blocks=1, actor_hidden_dim=16, critic_num_blocks=1, critic_hidden_dim=16,
         critic_state_encoder_dim=8, critic_action_encoder_dim=8, critic_num_bins=9,
-        latent_dim=16, belief_hidden_dim=16, use_amp=False, use_compile=False,
+        latent_dim=16, perception_model_dim=16, perception_ffn_dim=32, use_amp=False, use_compile=False,
         obs_drop_terms=(), obs_future_steps=None,
     )
     settings.update(options)
@@ -85,13 +82,15 @@ def make_policy(**options):
     return OneStageFlashSACVel(cfg, env.observation_spec, env.action_spec, env.reward_spec, "cpu", env)
 
 
-def test_primer_preserves_environment_batch_shape():
+def test_default_window_model_has_no_recurrent_state_or_replay_options():
     policy = make_policy()
-    primer = policy.make_tensordict_primer()
-    spec = primer.transform_observation_spec(policy.env.observation_spec.clone())
-    assert spec.shape == (4,)
-    assert spec[BELIEF_KEY].shape == (4, policy.cfg.belief_hidden_dim)
-    assert primer.primers.zero()[BELIEF_KEY].shape == (4, policy.cfg.belief_hidden_dim)
+    assert policy.cfg.adapt_module == "window_transformer"
+    assert not hasattr(policy.cfg, "burn_in") and not hasattr(policy.cfg, "belief_hidden_dim")
+    assert not any(isinstance(m, (torch.nn.GRU, torch.nn.GRUCell)) for m in policy.perception.modules())
+    assert policy.make_tensordict_primer() is None
+    defaults = OneStageFlashSACVelConfig()
+    assert (defaults.perception_window_size, defaults.perception_model_dim,
+            defaults.perception_num_layers, defaults.perception_num_heads) == (16, 128, 1, 4)
 
 
 def collect(policy, steps=22):
@@ -105,7 +104,6 @@ def collect(policy, steps=22):
             td = rollout(carry)
             nxt = policy.env.observation(time + 1)
             nxt["step_count"] = td["step_count"] + 1
-            nxt[BELIEF_KEY] = td["next", BELIEF_KEY].clone()
             terminated = torch.zeros(4, 1, dtype=torch.bool)
             truncated = torch.zeros_like(terminated)
             if time % 11 == 8:
@@ -123,7 +121,6 @@ def collect(policy, steps=22):
             carry = nxt.clone()
             carry["is_init"] = done.clone()
             carry["step_count"][done] = 0
-            carry[BELIEF_KEY][done[:, 0]] = 0
             # The reset state intentionally differs from the terminal state.
             carry["command"][done[:, 0], 0] = -100 - time
     assert policy.can_start_training()
@@ -165,8 +162,9 @@ def test_train_rollout_assigns_half_to_each_actor_and_eval_needs_no_privileged_i
     torch.testing.assert_close(result["flashsac_u"][:2], torch.full((2, 3), -.25))
     torch.testing.assert_close(result["flashsac_u"][2:], torch.full((2, 3), .5))
     torch.testing.assert_close(result["action"], td["ref_joint_pos_"] + policy.cfg.residual_scale * result["flashsac_u"])
-    assert result["next", BELIEF_KEY].shape == (4, 16)
-    student_only = td.select("policy", "vel_command", "depth", "is_init", "step_count", BELIEF_KEY, "ref_joint_pos_")
+    assert "belief_hx" not in result
+    assert not result["priv_pred"][:2].any()
+    student_only = td.select("policy", "vel_command", "depth", "is_init", "step_count", "ref_joint_pos_")
     with patch.object(policy._actor, "apply", side_effect=AssertionError("student eval used teacher")):
         full_eval = policy.get_rollout_policy("eval")(td.clone())
         sparse_eval = policy.get_rollout_policy("student")(student_only.clone())
@@ -302,9 +300,8 @@ def test_supervision_recomputes_the_current_teacher_latent():
         end = int(sequence.indices.max()) + 1
         predictions = policy.perception.sequence(
             sequence.depth[:, :end].float() / 100, policy._context(sequence.obs[:, :end]),
-            sequence.h0, sequence.is_init[:, :end], sequence.valid[:, :end], sequence.learning_start,
+            sequence.is_init[:, :end], sequence.valid[:, :end],
         )[0]
-        predictions = policy._gather(predictions, sequence.indices)
         raw = policy._gather(sequence.obs, sequence.indices)[..., :policy.replay_obs_dim]
         old_target = policy.actor.encode_priv(raw.flatten(0, 1)).reshape_as(predictions)
         policy.actor.encoder_priv[-1].bias.add_(2.0)
@@ -315,34 +312,34 @@ def test_supervision_recomputes_the_current_teacher_latent():
     torch.testing.assert_close(info["perception/priv_loss"], expected_loss)
 
 
-def test_terminal_bootstrap_forks_final_observation_from_pre_reset_belief():
+def test_terminal_bootstrap_uses_true_endpoint_and_pre_reset_raw_history():
     policy = make_policy()
     collect(policy)
     sequence = policy.buffer.gather([4, 4], [0, 2]).to("cpu")
     terminal = sequence.terminal_mask & sequence.learning_mask
     assert terminal.any()
+    rows, times = terminal.nonzero(as_tuple=True)
+    ends = sequence.bootstrap_index[rows, times]
+    prefix = policy.cfg.perception_window_size - 1
+    indices = ends[:, None] + torch.arange(1-prefix, 1)
+    final_depth = torch.cat([sequence.depth[rows[:, None], indices],
+                             sequence.terminal_depth[terminal][:, None]], 1).float()/100
+    final_obs = torch.cat([sequence.obs[rows[:, None], indices],
+                           sequence.terminal_obs[terminal][:, None]], 1)
+    flags = torch.zeros(rows.numel(), 1, dtype=torch.bool)
+    inits = torch.cat([sequence.is_init[rows[:, None], indices], flags], 1)
+    valid = torch.cat([sequence.valid[rows[:, None], indices], ~flags], 1)
     with torch.no_grad():
-        _, _, states, _ = policy.perception.sequence(
-            sequence.depth.float() / 100, policy._context(sequence.obs), sequence.h0,
-            sequence.is_init, sequence.valid,
-        )
-        expected_hidden = policy._gather(states, sequence.bootstrap_index)[terminal]
-    captured = []
-
-    def capture(module, args):
-        captured.append(tuple(value.detach().clone() for value in args))
-
-    hook = policy.perception.register_forward_pre_hook(capture)
-    batch = policy._sac_batch(sequence)
-    hook.remove()
-    assert len(captured) == 1
-    actual_depth, actual_context, actual_hidden, actual_reset = captured[0]
-    torch.testing.assert_close(actual_hidden, expected_hidden)
-    torch.testing.assert_close(actual_depth, sequence.terminal_depth[terminal].float() / 100)
-    torch.testing.assert_close(actual_context, policy._context(sequence.terminal_obs[terminal]))
-    assert not actual_reset.any()
-    assert batch["action"].shape[0] == policy.cfg.sample_batch_size
-    # FakeEnv's command[0] % 4 encodes environment identity for valid states.
+        expected = policy.perception(final_depth, policy._context(final_obs), inits, valid)[0]
+    predictions = []
+    original = policy.perception.window
+    def capture(*args):
+        value = original(*args)
+        predictions.append(value[0].clone())
+        return value
+    with patch.object(policy.perception, "window", side_effect=capture):
+        batch = policy._sac_batch(sequence)
+    torch.testing.assert_close(predictions[-1], expected)
     environment_ids = policy.actor.field(batch["actor_observation"], "command")[:, 0].long() % 4
     assert (environment_ids < 2).sum() == policy.cfg.sample_batch_size // 2
     assert (environment_ids >= 2).sum() == policy.cfg.sample_batch_size // 2
@@ -376,25 +373,35 @@ def test_full_checkpoint_roundtrip_restores_models_optimizers_and_counters_with_
     assert restored._update_step == before + 1
 
 
-def test_teacher_checkpoint_warmstart_preserves_fresh_student_and_perception():
-    student = make_policy()
-    kwargs = {field.name: getattr(student.cfg, field.name) for field in fields(FlashSACVelConfig)}
-    kwargs.update(adapt_module="gru", enable_residual_distillation=False)
-    cfg = FlashSACVelConfig(**kwargs)
-    env = student.env
-    teacher = FlashSACVel(cfg, env.observation_spec, env.action_spec, env.reward_spec, "cpu", env)
-    teacher_state = copy.deepcopy(teacher.state_dict())
-    before_student = copy.deepcopy(student.student_actor.state_dict())
-    before_perception = copy.deepcopy(student.perception.state_dict())
-    student.load_state_dict(teacher_state)
-    for name in ("actor", "critic", "target_critic", "temperature"):
-        assert_nested_equal(teacher_state[name], student.state_dict()[name])
-    assert_nested_equal(before_student, student.student_actor.state_dict())
-    assert_nested_equal(before_perception, student.perception.state_dict())
-    assert student.buffer is None
-    assert student._perception_updates == student._update_step == 0
-    student._interaction_steps = 1
-    state_before_rejected_load = copy.deepcopy(student.state_dict())
-    with pytest.raises(ValueError, match="fresh"):
-        student.load_state_dict(teacher_state)
-    assert_nested_equal(state_before_rejected_load, student.state_dict())
+@pytest.mark.parametrize("version", [None, 1])
+def test_old_checkpoints_are_rejected_before_loading_any_weights(version):
+    policy = make_policy()
+    before = copy.deepcopy(policy.state_dict())
+    old = copy.deepcopy(before)
+    if version is None:
+        old.pop("one_stage_version")
+    else:
+        old["one_stage_version"] = version
+    with pytest.raises(ValueError, match="window Transformer checkpoints"):
+        policy.load_state_dict(old)
+    assert_nested_equal(before, policy.state_dict())
+
+
+def test_teacher_rollout_skips_perception_and_train_only_caches_student_half():
+    policy = make_policy()
+    teacher = policy.get_rollout_policy("teacher")
+    with patch.object(policy.perception, "encode", side_effect=AssertionError("teacher encoded depth")):
+        teacher(policy.env.observation())
+    train = policy.get_rollout_policy("train")
+    train(policy.env.observation())
+    assert train._history.valid.shape == (2, policy.cfg.perception_window_size)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("perception_window_size", 0), ("perception_num_layers", 0),
+    ("perception_model_dim", 15), ("perception_num_heads", 0),
+    ("perception_ffn_dim", 0), ("adapt_module", "gru"),
+])
+def test_invalid_window_settings_fail_early(key, value):
+    with pytest.raises(ValueError):
+        make_policy(**{key: value})

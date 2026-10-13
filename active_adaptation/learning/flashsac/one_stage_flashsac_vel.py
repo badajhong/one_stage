@@ -1,4 +1,4 @@
-"""Joint teacher/student FlashSAC with a supervised gated recurrent perception.
+"""Joint teacher/student FlashSAC with a supervised window Transformer perception.
 
 Teacher and student own half the rollout environments and share one twin critic.
 The teacher encoder/input layout is inherited unchanged from FlashSACVel. A fresh
@@ -6,9 +6,9 @@ student perception predicts its latent, with an auxiliary object head. Only the
 supervised objective trains perception; both actors learn with SAC. A weak,
 scheduled pull additionally aligns encoder_priv toward detached student latents.
 
-Replay stores uint8 depth once, sparse pre-observation belief checkpoints, and
-ordered chunks. Old checkpoints plus short burn-in approximate current-model
-history; no stored latent is treated as a current perception prediction.
+Replay stores raw observations and uint8 depth once. Finite history windows are
+encoded with current weights; rollout refreshes cached features after each
+perception update. There is no recurrent hidden state or burn-in.
 """
 
 import math
@@ -20,8 +20,6 @@ import torch
 from torch import nn, optim
 from hydra.core.config_store import ConfigStore
 from tensordict.nn import TensorDictModuleBase
-from torchrl.data import Composite, Unbounded
-from torchrl.envs.transforms import TensorDictPrimer
 
 from ..ppo.common import ACTION_KEY, OBS_KEY
 from ..ppo.ppo_vel import DEPTH_KEY, VEL_CMD_KEY, OBJECT_KEY, PRIV_PRED_KEY, REF_JPOS_KEY
@@ -31,12 +29,9 @@ from .flashsac_upstream.agent import _sample_flashsac_actions
 from .flashsac_upstream.network import FlashSACActor, FlashSACTemperature
 from .flashsac_upstream.scheduler import ramp_cosine_decay_scheduler
 from .flashsac_upstream.utils_network import Network
-from .one_stage_perception import GatedBeliefPerception
-from .one_stage_replay import OneStageSequenceReplay
+from .one_stage_perception import WindowTransformerPerception, WindowHistory
+from .one_stage_replay import OneStageWindowReplay
 from .one_stage_update import update_joint_networks
-
-
-BELIEF_KEY = "belief_hx"
 
 
 @dataclass
@@ -45,13 +40,15 @@ class OneStageFlashSACVelConfig(FlashSACVelConfig):
     name: str = "one_stage_flashsac_vel"
     in_keys: List[str] = (*FlashSACVelConfig.in_keys, DEPTH_KEY)
     enable_rtx: bool = False
-    # Dynamic recurrent replay stays eager; optionally compile the SAC networks.
+    # Perception/window replay stays eager; optionally compile the SAC networks.
     use_compile: bool = False
-    adapt_module: str = "gated_belief"
+    adapt_module: str = "window_transformer"
     enable_residual_distillation: bool = False
-    belief_hidden_dim: int = 256
-    checkpoint_interval: int = 16
-    burn_in: int = 16
+    perception_window_size: int = 16
+    perception_model_dim: int = 128
+    perception_num_layers: int = 1
+    perception_num_heads: int = 4
+    perception_ffn_dim: int = 256
     sequence_length: int = 32
     depth_num_bins: int = 100
     perception_updates_per_iteration: int = 1
@@ -79,32 +76,38 @@ class OneStageRollout(TensorDictModuleBase):
         object.__setattr__(self, "policy", policy)
         self.mode = mode
         # Student inference needs no privileged teacher inputs or true object pose.
-        self.in_keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, "is_init", BELIEF_KEY]
+        self.in_keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, "is_init"]
         if mode in ("train", "teacher"):
             self.in_keys = list(dict.fromkeys([*self.in_keys, *policy.replay_env_keys]))
         if policy.cfg.action_mode == "residual" and REF_JPOS_KEY not in self.in_keys:
             self.in_keys.append(REF_JPOS_KEY)
-        self.out_keys = [ACTION_KEY, U_KEY, PRIV_PRED_KEY, ("next", BELIEF_KEY)]
+        self.out_keys = [ACTION_KEY, U_KEY, PRIV_PRED_KEY]
+        self._history = None
+        self._generation = -1
 
     @torch.no_grad()
     def forward(self, td):
         p = self.policy
         init = td["is_init"].bool()
-        hidden = td.get(BELIEF_KEY)
-        if hidden is None:
-            hidden = torch.zeros(*td.batch_size, p.cfg.belief_hidden_dim, device=p.device)
-        valid = p._valid_observation(td)
-        hidden = torch.where(init | ~valid.unsqueeze(-1), 0., hidden)
-        # Store the checkpoint before processing this observation.
-        td[BELIEF_KEY] = hidden
-        context = torch.cat([td[OBS_KEY], td[VEL_CMD_KEY]], -1)
-        latent, _, next_hidden, _ = p.perception(td[DEPTH_KEY].float(), context, hidden, init, valid)
+        if self.mode == "train" and td.shape[0] != p.num_envs:
+            raise ValueError("training rollout must retain the fixed teacher/student env partition")
+        # The teacher needs no perception inference. Both sources still store
+        # raw depth/context for training the student from replay.
+        student_slice = slice(p.num_envs // 2, None) if self.mode == "train" else slice(None)
+        latent = torch.zeros(*td.batch_size, p.cfg.latent_dim, device=p.device)
+        if self.mode != "teacher":
+            context = torch.cat([td[OBS_KEY][student_slice], td[VEL_CMD_KEY][student_slice]], -1)
+            if (self._history is None or self._history.valid.shape[0] != context.shape[0]
+                    or self._generation != p._rollout_generation):
+                self._history = WindowHistory(p.perception, context.shape[0], p.cfg.depth_num_bins)
+                self._generation = p._rollout_generation
+            latent[student_slice] = self._history.step(
+                p.perception, td[DEPTH_KEY][student_slice], context,
+                init[student_slice], p._valid_observation(td)[student_slice], p._perception_version,
+            )[0]
         td[PRIV_PRED_KEY] = latent
-        td["next", BELIEF_KEY] = next_hidden
         student_input = torch.cat([td[VEL_CMD_KEY], td[OBS_KEY], latent], -1)
         if self.mode == "train":
-            if td.shape[0] != p.num_envs:
-                raise ValueError("training rollout must retain the fixed teacher/student env partition")
             if ACTION_DR_KEY in p.replay_keys:
                 td[ACTION_DR_KEY] = p.action_dr()
             teacher_obs = p.replay_obs(td)
@@ -126,17 +129,20 @@ class OneStageRollout(TensorDictModuleBase):
 
 
 class OneStageFlashSACVel(FlashSACVel):
-    checkpoint_version = 1
+    checkpoint_version = 2
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
-        for key in ("checkpoint_interval", "sequence_length", "belief_hidden_dim",
+        for key in ("perception_window_size", "perception_model_dim", "perception_num_layers",
+                    "perception_num_heads", "perception_ffn_dim", "sequence_length",
                     "perception_updates_per_iteration", "train_every", "n_step",
                     "sample_batch_size", "buffer_max_length", "actor_update_period"):
             value = getattr(cfg, key)
             if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
                 raise ValueError(f"{key} must be a positive integer")
-        if isinstance(cfg.burn_in, bool) or not isinstance(cfg.burn_in, Integral) or cfg.burn_in < 0:
-            raise ValueError("burn_in must be a nonnegative integer")
+        if cfg.adapt_module != "window_transformer":
+            raise ValueError("one-stage FlashSAC uses adapt_module=window_transformer")
+        if cfg.perception_model_dim % cfg.perception_num_heads:
+            raise ValueError("perception_model_dim must be divisible by perception_num_heads")
         if not 1 <= cfg.depth_num_bins <= 255 or not isinstance(cfg.depth_num_bins, Integral):
             raise ValueError("uint8 replay needs depth_num_bins in [1,255]")
         if cfg.sample_batch_size % (2 * cfg.sequence_length):
@@ -176,6 +182,7 @@ class OneStageFlashSACVel(FlashSACVel):
         self._perception_version = 0
         self._perception_updates = 0
         self._noise = {}
+        self._rollout_generation = 0
         self.teacher_env_mask = torch.arange(self.num_envs, device=self.device) < self.num_envs // 2
         self.student_env_mask = ~self.teacher_env_mask
         self.replay_dim = self.replay_obs_dim + self.vel_command_dim
@@ -203,17 +210,19 @@ class OneStageFlashSACVel(FlashSACVel):
 
     def _build_adaptation(self, observation_spec):
         # Called by FlashSACVel after constructing its unchanged privileged actor.
-        # Deliberately do not create the two legacy GRUs/object-transform adaptor.
+        # The one-stage learner exclusively uses the finite-window perception model.
         cfg = self.cfg
         self.vel_command_dim = observation_spec[VEL_CMD_KEY].shape[-1]
         self.policy_dim = observation_spec[OBS_KEY].shape[-1]
         geometry = self.actor.object_points_template
         if geometry is None:
-            raise ValueError("gated belief requires known object-frame geometry")
-        self.perception = GatedBeliefPerception(
+            raise ValueError("window perception requires known object-frame geometry")
+        self.perception = WindowTransformerPerception(
             self.policy_dim + self.vel_command_dim, self.depth_shape,
             observation_spec[OBJECT_KEY].shape[-1], geometry,
-            latent_dim=cfg.latent_dim, hidden_dim=cfg.belief_hidden_dim,
+            latent_dim=cfg.latent_dim, window_size=cfg.perception_window_size,
+            model_dim=cfg.perception_model_dim, num_layers=cfg.perception_num_layers,
+            num_heads=cfg.perception_num_heads, ffn_dim=cfg.perception_ffn_dim,
         ).to(self.device)
         self.opt_perception = optim.Adam(self.perception.parameters(), lr=cfg.adapt_learning_rate)
         self._student = self._make_network(FlashSACActor(
@@ -226,12 +235,8 @@ class OneStageFlashSACVel(FlashSACVel):
         self.student_temperature = _raw(self._student_temperature)
 
     def make_tensordict_primer(self):
-        # The hidden spec already includes the environment batch dimension.
-        # Explicit Composite shape works with both TorchRL 0.7 and 0.8+.
-        spec = Composite({BELIEF_KEY: Unbounded(
-            (self.num_envs, self.cfg.belief_hidden_dim), device=self.device)},
-            shape=(self.num_envs,), device=self.device)
-        return TensorDictPrimer(spec, reset_key="done")
+        # Each rollout owns a raw-frame window; the environment carries no RNN state.
+        return None
 
     def get_rollout_policy(self, mode="train"):
         return OneStageRollout(self, mode)
@@ -274,18 +279,17 @@ class OneStageFlashSACVel(FlashSACVel):
 
     def _allocate_replay(self):
         cfg = self.cfg
-        self.buffer = OneStageSequenceReplay(
+        self.buffer = OneStageWindowReplay(
             num_envs=self.num_envs, capacity=cfg.buffer_max_length,
             obs_dim=self.replay_dim, action_dim=self.action_dim, depth_shape=self.depth_shape,
-            hidden_dim=cfg.belief_hidden_dim, checkpoint_interval=cfg.checkpoint_interval,
-            burn_in=cfg.burn_in, sequence_length=cfg.sequence_length,
+            window_size=cfg.perception_window_size, sequence_length=cfg.sequence_length,
             n_step=cfg.n_step, gamma=cfg.gamma, num_depth_bins=cfg.depth_num_bins,
             obs_dtype=getattr(torch, cfg.buffer_obs_dtype), device=self.device,
             batch_size=self._sequence_batch_size, min_length=cfg.buffer_min_length,
         )
         print(f"[OneStage FlashSAC] replay {self.buffer.capacity:,} rows, "
               f"{self.buffer.nbytes() / 2**30:.2f} GiB; depth uint8, "
-              f"hidden checkpoint every {cfg.checkpoint_interval} steps.")
+              f"window {cfg.perception_window_size}, no hidden checkpoints.")
 
     @torch.no_grad()
     def add_transition(self, td):
@@ -302,11 +306,11 @@ class OneStageFlashSACVel(FlashSACVel):
             cut = cut | (truncated & ~time_limit)
         reward = nxt["reward"].sum(-1)
         self.buffer.add(
-            obs=self._stored_observation(td), depth=td[DEPTH_KEY], h_pre=td[BELIEF_KEY],
+            obs=self._stored_observation(td), depth=td[DEPTH_KEY],
             is_init=td["is_init"].squeeze(-1), action=td[U_KEY], reward=reward,
             discount=nxt["discount"].squeeze(-1), done=terminated | truncated, cut=cut,
             valid=self._valid_observation(td), next_obs=self._stored_observation(nxt),
-            next_depth=nxt[DEPTH_KEY], version=self._perception_version,
+            next_depth=nxt[DEPTH_KEY],
         )
         if self.reward_normalizer is not None:
             self.reward_normalizer.update_reward_stats(reward, terminated, truncated)
@@ -343,11 +347,10 @@ class OneStageFlashSACVel(FlashSACVel):
         # Do not build a backward graph for the future bootstrap-only tail.
         end = int(batch.indices.max()) + 1
         obs = batch.obs[:, :end]
-        z, obj, _, gates = self.perception.sequence(
+        z, obj = self.perception.sequence(
             batch.depth[:, :end].float() / self.cfg.depth_num_bins, self._context(obs),
-            batch.h0, batch.is_init[:, :end], batch.valid[:, :end], batch.learning_start,
+            batch.is_init[:, :end], batch.valid[:, :end],
         )
-        z, obj = self._gather(z, batch.indices), self._gather(obj, batch.indices)
         learning_obs = self._gather(batch.obs, batch.indices)[..., :self.replay_obs_dim]
         with torch.no_grad():
             target = self.actor.encode_priv(learning_obs.flatten(0, 1)).reshape_as(z)
@@ -364,40 +367,42 @@ class OneStageFlashSACVel(FlashSACVel):
         self.opt_perception.zero_grad(set_to_none=True)
         self._perception_version += 1
         self._perception_updates += 1
-        gate = self._gather(gates, batch.indices).detach()
         return {
             "perception/loss": loss.detach(), "perception/priv_loss": priv_loss.detach(),
             "perception/object_loss": object_loss.detach(), "perception/grad_norm": norm.detach(),
-            "perception/gate_mean": (gate.mean(-1) * weights).sum(),
-            "perception/gate_closed_fraction": ((gate < .05).float().mean(-1) * weights).sum(),
-            "perception/gate_open_fraction": ((gate > .95).float().mean(-1) * weights).sum(),
-            "perception/checkpoint_age": (self._perception_version - batch.checkpoint_version).float().mean(),
         }
 
     @torch.no_grad()
     def _sac_batch(self, sequence):
         obs = sequence.obs
-        z, _, hidden, _ = self.perception.sequence(
-            sequence.depth.float() / self.cfg.depth_num_bins, self._context(obs),
-            sequence.h0, sequence.is_init, sequence.valid,
-        )
+        tokens = self.perception.encode(sequence.depth.float() / self.cfg.depth_num_bins, self._context(obs))
+        z, _ = self.perception.sequence_from_tokens(tokens, sequence.is_init, sequence.valid)
+        prefix = self.cfg.perception_window_size - 1
         current_obs = self._gather(obs, sequence.indices)
-        current_z = self._gather(z, sequence.indices)
+        current_z = self._gather(z, sequence.indices - prefix)
         next_obs = self._gather(obs, sequence.bootstrap_index).clone()
-        next_z = self._gather(z, sequence.bootstrap_index).clone()
+        next_z = self._gather(z, sequence.bootstrap_index - prefix).clone()
         terminal = sequence.terminal_mask & sequence.learning_mask
         if terminal.any():
-            # Fork the true final observation from the belief after processing the
-            # final action's state. The next episode's reset must not affect it.
-            final_h = self._gather(hidden, sequence.bootstrap_index)[terminal]
+            # Append the true endpoint to the last L-1 raw-frame features from
+            # the ending episode, never to the reset observation's window.
+            rows, times = terminal.nonzero(as_tuple=True)
+            ends = sequence.bootstrap_index[rows, times]
+            history_index = ends[:, None] + torch.arange(1 - prefix, 1, device=self.device)
+            history_tokens = tokens[rows[:, None], history_index]
+            history_init = sequence.is_init[rows[:, None], history_index]
+            history_valid = sequence.valid[rows[:, None], history_index]
             final_obs = sequence.terminal_obs[terminal]
-            final_z, _, _, _ = self.perception(
+            final_tokens = self.perception.encode(
                 sequence.terminal_depth[terminal].float() / self.cfg.depth_num_bins,
-                self._context(final_obs), final_h,
-                torch.zeros(final_h.shape[0], 1, dtype=torch.bool, device=self.device),
-            )
+                self._context(final_obs))
+            final_init = torch.zeros(final_tokens.shape[0], 1, dtype=torch.bool, device=self.device)
+            window_tokens = torch.cat([history_tokens, final_tokens[:, None]], dim=1)
+            window_valid = self.perception.window_valid(
+                torch.cat([history_init, final_init], dim=1),
+                torch.cat([history_valid, ~final_init], dim=1))
+            next_z[terminal] = self.perception.window(window_tokens, window_valid)[0]
             next_obs[terminal] = final_obs
-            next_z[terminal] = final_z
         # Episode lengths may change valid counts. Enforce 50:50 on the actual
         # transitions presented to SAC, not only on the number of sampled chunks.
         source = sequence.source[:, None].expand_as(sequence.learning_mask).flatten()
@@ -471,9 +476,12 @@ class OneStageFlashSACVel(FlashSACVel):
     def _schema(self):
         return {
             "depth_shape": list(self.depth_shape), "depth_num_bins": self.cfg.depth_num_bins,
-            "belief_hidden_dim": self.cfg.belief_hidden_dim, "latent_dim": self.cfg.latent_dim,
-            "vel_command_dim": self.vel_command_dim, "checkpoint_interval": self.cfg.checkpoint_interval,
-            "burn_in": self.cfg.burn_in, "sequence_length": self.cfg.sequence_length,
+            "architecture": "small_cnn_window_transformer_v1",
+            "latent_dim": self.cfg.latent_dim, "vel_command_dim": self.vel_command_dim,
+            "window_size": self.cfg.perception_window_size,
+            "model_dim": self.cfg.perception_model_dim, "num_layers": self.cfg.perception_num_layers,
+            "num_heads": self.cfg.perception_num_heads, "ffn_dim": self.cfg.perception_ffn_dim,
+            "sequence_length": self.cfg.sequence_length,
             "n_step": self.cfg.n_step, "gamma": self.cfg.gamma,
         }
 
@@ -492,11 +500,9 @@ class OneStageFlashSACVel(FlashSACVel):
         return state
 
     def load_state_dict(self, state, strict=True):
-        resume = "one_stage_version" in state
-        if not resume and (self._interaction_steps or self._update_step or self._perception_updates):
-            raise ValueError("load a teacher-only checkpoint into a fresh OneStageFlashSACVel instance")
-        if resume and (state["one_stage_version"] != self.checkpoint_version
-                       or state.get("one_stage_schema") != self._schema()):
+        if state.get("one_stage_version") != self.checkpoint_version:
+            raise ValueError("This learner only loads window Transformer checkpoints; start a new run for older models")
+        if state.get("one_stage_schema") != self._schema():
             raise ValueError("one-stage checkpoint schema does not match the model/replay configuration")
         layout = [(k, s, e, list(shape)) for k, s, e, shape in self.replay_layout]
         if state.get("replay_layout") != layout or state.get("obs_layout") != self.obs_layout:
@@ -512,22 +518,21 @@ class OneStageFlashSACVel(FlashSACVel):
         template = state["actor"].get("object_points_template")
         if template is None or not torch.equal(template.cpu(), self.actor.object_points_template.cpu()):
             raise ValueError("checkpoint object-frame geometry does not match this task")
-        networks = self._networks() if resume else FlashSACVelFlat._networks(self)
+        networks = self._networks()
         for name, network in networks.items():
             _raw(network).load_state_dict(state[name], strict=strict)
-            if resume and network.optimizer is not None:
+            if network.optimizer is not None:
                 network.optimizer.load_state_dict(state[f"{name}_optimizer"])
                 network.scheduler.load_state_dict(state[f"{name}_scheduler"])
-        if resume:
-            self.perception.load_state_dict(state["perception"], strict=strict)
-            self.opt_perception.load_state_dict(state["perception_optimizer"])
-            self._perception_version = state["perception_version"]
-            self._perception_updates = state["perception_updates"]
-            self._interaction_steps = state["interaction_steps"]
-            self._update_step = state["update_step"]
-            self._update_counter = state.get("update_counter", 0.)
-            self._grad_scaler.load_state_dict(state["grad_scaler"])
-            self.env.set_progress(state.get("last_iter", 0))
+        self.perception.load_state_dict(state["perception"], strict=strict)
+        self.opt_perception.load_state_dict(state["perception_optimizer"])
+        self._perception_version = state["perception_version"]
+        self._perception_updates = state["perception_updates"]
+        self._interaction_steps = state["interaction_steps"]
+        self._update_step = state["update_step"]
+        self._update_counter = state.get("update_counter", 0.)
+        self._grad_scaler.load_state_dict(state["grad_scaler"])
+        self.env.set_progress(state.get("last_iter", 0))
         if self.reward_normalizer is not None and "reward_normalizer" in state:
             rn, saved = self.reward_normalizer, state["reward_normalizer"]
             # Replay and episodes restart; do not restore returns from old live envs.
@@ -537,9 +542,9 @@ class OneStageFlashSACVel(FlashSACVel):
             rn.G_rms.var = saved["G_rms_var"].to(self.device)
             rn.G_rms.count = saved["G_rms_count"].to(self.device)
         self.buffer = None
+        self._rollout_generation += 1
         self._noise.clear()
         self._info_sum.clear()
         self._info_cnt.clear()
-        print("[OneStage FlashSAC] " + ("resumed model/optimizers; replay starts empty" if resume
-              else "loaded teacher/Q weights; student perception and optimizers start fresh"))
+        print("[OneStage FlashSAC] resumed window model/optimizers; replay and rollout history start empty")
         return []

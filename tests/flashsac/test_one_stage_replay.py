@@ -16,7 +16,7 @@ SPEC = importlib.util.spec_from_file_location("one_stage_replay_under_test", MOD
 replay_module = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = replay_module
 SPEC.loader.exec_module(replay_module)
-OneStageSequenceReplay = replay_module.OneStageSequenceReplay
+OneStageWindowReplay = replay_module.OneStageWindowReplay
 encode_depth = replay_module.encode_depth
 decode_depth = replay_module.decode_depth
 
@@ -24,11 +24,11 @@ decode_depth = replay_module.decode_depth
 def make_replay(**kwargs):
     options = dict(
         num_envs=4, capacity=80, obs_dim=2, action_dim=1, depth_shape=(1, 2, 2),
-        hidden_dim=3, checkpoint_interval=2, burn_in=2, sequence_length=3,
+        window_size=3, sequence_length=3,
         n_step=3, gamma=0.9, batch_size=4, check_memory=False,
     )
     options.update(kwargs)
-    return OneStageSequenceReplay(**options)
+    return OneStageWindowReplay(**options)
 
 
 def add_step(replay, t, *, dones=(), cuts=(), inits=(), invalid=(), soft_discount=1.0):
@@ -46,11 +46,11 @@ def add_step(replay, t, *, dones=(), cuts=(), inits=(), invalid=(), soft_discoun
         next_obs[done, 0] = 1000 + t
         next_depth[done] = 0.99
     replay.add(
-        obs=obs, depth=depth, h_pre=torch.full((n, replay.hidden_dim), float(t)),
+        obs=obs, depth=depth,
         is_init=torch.isin(env, torch.tensor(inits)), action=torch.full((n, 1), t / 100),
         reward=torch.full((n,), float(t + 1)), discount=torch.full((n,), soft_discount),
         done=done, cut=cut, valid=~torch.isin(env, torch.tensor(invalid)),
-        next_obs=next_obs, next_depth=next_depth, version=t // 2,
+        next_obs=next_obs, next_depth=next_depth,
     )
 
 
@@ -97,7 +97,7 @@ def test_true_terminal_zeroes_bootstrap_and_never_includes_new_episode_rewards()
     assert (batch.bootstrap_discount[0, :2] == 0).all()
     assert batch.terminal_mask[0, :2].all()
     # The following reset row can begin a new valid trajectory, provided the
-    # environment marked it valid; its belief is reset separately by is_init.
+    # environment marked it valid; its window is reset separately by is_init.
     assert batch.learning_mask[0, 2]
     assert not batch.terminal_mask[0, 2]
     assert batch.bootstrap_index[0, 2] == 7
@@ -159,19 +159,16 @@ def test_ring_wrap_preserves_absolute_order_and_drops_overwritten_endpoints():
                  inits=(0,) if t in (6, 36) else ())
     assert len(replay) == replay.capacity == 48
     assert set(replay._terminal_next) == {35}
-    batch = replay.gather([28, 30], [0, 2], [1, 0])
-    assert torch.equal(batch.obs[0, :, 0], torch.arange(28, 37).half())
-    assert torch.equal(batch.obs[1, :, 0], torch.arange(30, 39).half())
-    assert torch.equal(batch.h0[:, 0], torch.tensor([28, 30], dtype=torch.float16))
-    assert torch.equal(batch.checkpoint_version, torch.tensor([14, 15]))
-    assert torch.equal(batch.learning_start, torch.tensor([3, 2]))
+    batch = replay.gather([28, 30], [0, 2])
+    assert torch.equal(batch.obs[0, :, 0], torch.arange(28, 36).half())
+    assert torch.equal(batch.obs[1, :, 0], torch.arange(30, 38).half())
+    assert torch.equal(batch.start_step, torch.tensor([28, 30]))
     with pytest.raises(ValueError, match="overwritten"):
         replay.gather([0], [0])
-    with pytest.raises(ValueError, match="unaligned"):
-        replay.gather([29], [0])
+    assert replay.gather([29], [0]).obs[0, 0, 0] == 29
     for _ in range(10):
         sampled = replay.sample(4)
-        assert ((sampled.checkpoint_step >= 28) & (sampled.checkpoint_step <= 30)).all()
+        assert ((sampled.start_step >= 28) & (sampled.start_step <= 32)).all()
 
 
 def test_balanced_sampling_weights_correct_different_valid_counts_and_preserves_dtype():
@@ -186,21 +183,21 @@ def test_balanced_sampling_weights_correct_different_valid_counts_and_preserves_
         torch.testing.assert_close(batch.sample_weight[batch.source == source].sum(), torch.tensor(0.5))
     assert (batch.sample_weight[~batch.learning_mask] == 0).all()
     assert batch.depth.dtype == batch.terminal_depth.dtype == torch.uint8
-    assert batch.obs.dtype == batch.terminal_obs.dtype == batch.h0.dtype == torch.float32
+    assert batch.obs.dtype == batch.terminal_obs.dtype == torch.float32
     assert replay.obs.dtype == torch.float16
     assert replay.depth.dtype == torch.uint8
 
 
-def test_sparse_checkpoint_memory_and_capacity_estimate():
-    replay = make_replay(capacity=4 * 120, checkpoint_interval=16, burn_in=16, sequence_length=32)
+def test_raw_frame_memory_and_minimum_window_capacity():
+    replay = make_replay(capacity=4 * 120, window_size=16, sequence_length=32)
     assert replay.nbytes() == replay.estimated_nbytes()
-    assert replay.checkpoint_hidden.shape == (9, 4, 3)
+    assert not any("hidden" in name or "checkpoint" in name for name in vars(replay))
     base_bytes = replay.nbytes()
     add_step(replay, 0, dones=(0, 2))
     assert replay.nbytes() == base_bytes + 2 * (8 + 2 * 2 + 4)
     assert not replay.can_sample()
-    with pytest.raises(ValueError, match="81 steps"):
-        make_replay(capacity=4 * 80, checkpoint_interval=16, burn_in=16, sequence_length=32)
+    with pytest.raises(ValueError, match="50 steps"):
+        make_replay(capacity=4 * 49, window_size=16, sequence_length=32)
 
 
 def test_no_valid_student_source_is_not_sampleable():
@@ -212,15 +209,15 @@ def test_no_valid_student_source_is_not_sampleable():
         replay.sample()
 
 
-def test_default_chunk_layout_supports_16_to_31_step_burnin():
-    replay = make_replay(capacity=4 * 100, checkpoint_interval=16, burn_in=16, sequence_length=32)
+def test_default_chunk_has_15_context_32_learning_and_3_bootstrap_frames():
+    replay = make_replay(capacity=4 * 100, window_size=16, sequence_length=32)
     for t in range(90):
         add_step(replay, t)
-    batch = replay.gather([0, 16], [0, 2], [0, 15])
-    assert batch.obs.shape == (2, 66, 2)
-    assert torch.equal(batch.learning_start, torch.tensor([16, 31]))
-    assert torch.equal(batch.indices[:, -1], torch.tensor([47, 62]))
-    assert torch.equal(batch.bootstrap_index[:, -1], torch.tensor([50, 65]))
+    batch = replay.gather([0, 16], [0, 2])
+    assert batch.obs.shape == (2, 50, 2)
+    assert torch.equal(batch.indices[:, 0], torch.tensor([15, 15]))
+    assert torch.equal(batch.indices[:, -1], torch.tensor([46, 46]))
+    assert torch.equal(batch.bootstrap_index[:, -1], torch.tensor([49, 49]))
     assert batch.learning_mask.all()
 
 
@@ -232,7 +229,7 @@ def test_memory_guard_precedes_tensor_allocation(monkeypatch):
         assert not hasattr(self, "obs")
         raise MemoryError("test capacity guard")
 
-    monkeypatch.setattr(OneStageSequenceReplay, "_check_memory", deny)
+    monkeypatch.setattr(OneStageWindowReplay, "_check_memory", deny)
     with pytest.raises(MemoryError, match="test capacity guard"):
         make_replay(check_memory=True)
     assert checked[0] > 0
@@ -254,8 +251,8 @@ def test_constant_time_availability_matches_reference_after_repeated_ring_wraps(
         if last < first:
             expected = False
         else:
-            start = first * replay.checkpoint_interval + replay.burn_in
-            end = last * replay.checkpoint_interval + replay.total_sequence_length - replay.n_step
+            start = first + replay.window_size - 1
+            end = last + replay.total_sequence_length - replay.n_step
             rows = torch.arange(start, end) % replay.T
             expected = bool(replay.valid[rows, :2].any() and replay.valid[rows, 2:].any())
         assert replay.can_sample() == expected
@@ -270,16 +267,16 @@ def test_constant_time_availability_matches_reference_after_repeated_ring_wraps(
     assert replay.can_sample()
 
 
-def test_sparse_hidden_ring_never_reuses_an_overwritten_checkpoint():
+def test_window_history_never_reads_overwritten_rows():
     replay = make_replay(capacity=4 * 13)
     for t in range(150):
         add_step(replay, t)
         first, last = replay._anchor_bounds()
         if last < first:
             continue
-        anchors = torch.arange(first, last + 1) * replay.checkpoint_interval
+        anchors = torch.arange(first, last + 1)
         envs = torch.zeros_like(anchors)
         batch = replay.gather(anchors, envs)
-        assert torch.equal(batch.h0[:, 0], anchors.half())
-        assert torch.equal(batch.checkpoint_version, anchors // 2)
+        assert torch.equal(batch.obs[:, 0, 0], anchors.half())
+        assert torch.equal(batch.obs[:, -1, 0], (anchors + replay.total_sequence_length - 1).half())
     assert replay.nbytes() == replay.estimated_nbytes()
