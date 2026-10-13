@@ -168,6 +168,10 @@
     "scheduler.py": {
       "description": "Copied from sibling VAIC checkout: adds ramp_cosine_decay_scheduler.",
       "sha256": "87d33f5069a0ec126baf83a8c3697ee3e92cc6ea785df075fbb1a78487780143"
+    },
+    "update.py": {
+      "description": "Adds an optional actor regularizer callback, combined with SAC/BC in the existing optimizer step; used for one-stage teacher latent alignment.",
+      "sha256": "36316a9e05caf1accec4e62f747099dd7b20ba1568216b5e1be52f658cadee49"
     }
   },
   "license": "MIT; LICENSE copied from the repository at the recorded commit."

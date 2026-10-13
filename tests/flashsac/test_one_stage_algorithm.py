@@ -18,6 +18,7 @@ from active_adaptation.learning.flashsac.flashsac_vel import FlashSACVel, FlashS
 from active_adaptation.learning.flashsac.one_stage_flashsac_vel import (
     BELIEF_KEY, OneStageFlashSACVel, OneStageFlashSACVelConfig,
 )
+from active_adaptation.learning.flashsac.one_stage_update import _teacher_pull_loss
 
 
 torch.set_num_threads(2)
@@ -82,6 +83,15 @@ def make_policy(**options):
     settings.update(options)
     cfg = OneStageFlashSACVelConfig(**settings)
     return OneStageFlashSACVel(cfg, env.observation_spec, env.action_spec, env.reward_spec, "cpu", env)
+
+
+def test_primer_preserves_environment_batch_shape():
+    policy = make_policy()
+    primer = policy.make_tensordict_primer()
+    spec = primer.transform_observation_spec(policy.env.observation_spec.clone())
+    assert spec.shape == (4,)
+    assert spec[BELIEF_KEY].shape == (4, policy.cfg.belief_hidden_dim)
+    assert primer.primers.zero()[BELIEF_KEY].shape == (4, policy.cfg.belief_hidden_dim)
 
 
 def collect(policy, steps=22):
@@ -206,6 +216,82 @@ def test_public_update_starts_supervision_at_warmup_and_honors_fractional_sac_ra
     assert "sac/student/actor/lr" in info
     assert not any(key.startswith(("train/", "teacher/", "student/")) for key in info)
     assert not policy._info_sum and not policy._info_cnt
+
+
+def test_pull_only_trains_teacher_encoder_and_caps_gradient_norm():
+    policy = make_policy()
+    collect(policy)
+    batch = policy._sac_batch(policy.buffer.sample())
+    batch["actor_observation"].requires_grad_(True)
+    batch["student_latent"] = (batch["student_latent"] + 1).detach().requires_grad_(True)
+    teacher_z = policy.actor.encode_priv(batch["actor_observation"])
+    rl_loss = teacher_z.square().mean()
+    loss, info = _teacher_pull_loss(policy.actor, batch, rl_loss, 1000., .1)
+    loss.backward()
+    assert batch["student_latent"].grad is None
+    assert batch["actor_observation"].grad is None
+    assert all(p.grad is None for p in policy.perception.parameters())
+    assert all(p.grad is None for p in policy.actor.policy.parameters())
+    assert all(p.grad is None for p in policy.critic.parameters())
+    norm = torch.stack([p.grad.square().sum() for p in policy.actor.encoder_priv.parameters()]).sum().sqrt()
+    assert norm > 0
+    assert info["pull_effective_coef"] < 1000.
+    torch.testing.assert_close(norm, .1 * info["rl_encoder_grad_norm"], rtol=1e-4, atol=1e-8)
+
+
+def test_pull_has_no_influence_when_rl_encoder_gradient_is_zero():
+    policy = make_policy()
+    collect(policy)
+    batch = policy._sac_batch(policy.buffer.sample())
+    rl_loss = policy.actor.encode_priv(batch["actor_observation"]).sum() * 0
+    loss, info = _teacher_pull_loss(policy.actor, batch, rl_loss, .001, .1)
+    assert loss.item() == info["pull_effective_coef"].item() == 0
+
+
+def test_active_pull_shares_teacher_optimizer_step_and_keeps_perception_detached():
+    policy = make_policy(teacher_pull_warmup_updates=0, teacher_pull_ramp_updates=0)
+    collect(policy)
+    before = parameters(policy.perception)
+    with patch.object(policy._actor.optimizer, "step", wraps=policy._actor.optimizer.step) as step:
+        info = policy._update_once()
+    assert step.call_count == 1
+    assert not changed(before, policy.perception)
+    assert all(p.grad is None for p in policy.perception.parameters())
+    assert info["teacher/actor/pull_effective_coef"] > 0
+    assert info["teacher/actor/pull_grad_ratio"] <= .10001
+    assert not any("pull" in key for key in info if key.startswith("student/"))
+    assert all(torch.isfinite(value).all() for value in info.values())
+    # Delayed SAC actor steps must not apply the auxiliary loss either.
+    before_encoder = parameters(policy.actor.encoder_priv)
+    info = policy._update_once()
+    assert not changed(before_encoder, policy.actor.encoder_priv)
+    assert "teacher/actor/pull_loss" not in info
+
+
+def test_pull_schedule_defaults_disable_and_checkpoint_resume():
+    policy = make_policy()
+    assert policy.cfg.teacher_pull_enabled
+    for count, expected in [(0, 0), (99, 0), (100, 0), (600, .0005), (1100, .001), (2000, .001)]:
+        policy._perception_updates = count
+        assert policy._teacher_pull_weight() == pytest.approx(expected)
+    restored = make_policy()
+    restored.load_state_dict(copy.deepcopy(policy.state_dict()))
+    assert restored._teacher_pull_weight() == policy._teacher_pull_weight()
+    policy.cfg.teacher_pull_enabled = False
+    assert policy._teacher_pull_weight() == 0
+    policy.cfg.teacher_pull_enabled = True
+    policy.cfg.teacher_pull_coef = 0
+    assert policy._teacher_pull_weight() == 0
+
+
+@pytest.mark.parametrize("key,value", [
+    ("teacher_pull_coef", -1), ("teacher_pull_coef", float("nan")),
+    ("teacher_pull_max_grad_ratio", -1), ("teacher_pull_max_grad_ratio", float("inf")),
+    ("teacher_pull_warmup_updates", -1), ("teacher_pull_ramp_updates", 1.5),
+])
+def test_invalid_pull_settings_fail_early(key, value):
+    with pytest.raises(ValueError, match=key):
+        make_policy(**{key: value})
 
 
 def test_supervision_recomputes_the_current_teacher_latent():

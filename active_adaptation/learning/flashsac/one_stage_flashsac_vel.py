@@ -3,7 +3,8 @@
 Teacher and student own half the rollout environments and share one twin critic.
 The teacher encoder/input layout is inherited unchanged from FlashSACVel. A fresh
 student perception predicts its latent, with an auxiliary object head. Only the
-supervised objective trains perception; both actors learn with SAC.
+supervised objective trains perception; both actors learn with SAC. A weak,
+scheduled pull additionally aligns encoder_priv toward detached student latents.
 
 Replay stores uint8 depth once, sparse pre-observation belief checkpoints, and
 ordered chunks. Old checkpoints plus short burn-in approximate current-model
@@ -19,7 +20,7 @@ import torch
 from torch import nn, optim
 from hydra.core.config_store import ConfigStore
 from tensordict.nn import TensorDictModuleBase
-from torchrl.data import Unbounded
+from torchrl.data import Composite, Unbounded
 from torchrl.envs.transforms import TensorDictPrimer
 
 from ..ppo.common import ACTION_KEY, OBS_KEY
@@ -56,6 +57,12 @@ class OneStageFlashSACVelConfig(FlashSACVelConfig):
     perception_updates_per_iteration: int = 1
     priv_loss_coef: float = 1.0
     object_loss_coef: float = 1.0
+    teacher_pull_enabled: bool = True
+    teacher_pull_coef: float = 0.001
+    # Count successful perception optimizer updates (restored on resume).
+    teacher_pull_warmup_updates: int = 100
+    teacher_pull_ramp_updates: int = 1000
+    teacher_pull_max_grad_ratio: float = 0.1
     buffer_device_type: str = "cpu"
     buffer_min_length: int = 100_000
 
@@ -142,7 +149,12 @@ class OneStageFlashSACVel(FlashSACVel):
             raise ValueError("one-stage depth replay currently uses CPU storage")
         if cfg.buffer_obs_dtype not in ("float16", "float32"):
             raise ValueError("buffer_obs_dtype must be float16 or float32")
-        for key in ("priv_loss_coef", "object_loss_coef", "updates_per_interaction_step"):
+        for key in ("teacher_pull_warmup_updates", "teacher_pull_ramp_updates"):
+            value = getattr(cfg, key)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ValueError(f"{key} must be a nonnegative integer")
+        for key in ("priv_loss_coef", "object_loss_coef", "updates_per_interaction_step",
+                    "teacher_pull_coef", "teacher_pull_max_grad_ratio"):
             if not math.isfinite(getattr(cfg, key)) or getattr(cfg, key) < 0:
                 raise ValueError(f"{key} must be finite and nonnegative")
         if cfg.priv_loss_coef <= 0:
@@ -214,8 +226,12 @@ class OneStageFlashSACVel(FlashSACVel):
         self.student_temperature = _raw(self._student_temperature)
 
     def make_tensordict_primer(self):
-        return TensorDictPrimer({BELIEF_KEY: Unbounded(
-            (self.num_envs, self.cfg.belief_hidden_dim), device=self.device)}, reset_key="done")
+        # The hidden spec already includes the environment batch dimension.
+        # Explicit Composite shape works with both TorchRL 0.7 and 0.8+.
+        spec = Composite({BELIEF_KEY: Unbounded(
+            (self.num_envs, self.cfg.belief_hidden_dim), device=self.device)},
+            shape=(self.num_envs,), device=self.device)
+        return TensorDictPrimer(spec, reset_key="done")
 
     def get_rollout_policy(self, mode="train"):
         return OneStageRollout(self, mode)
@@ -402,6 +418,7 @@ class OneStageFlashSACVel(FlashSACVel):
             "next_observation": take(self.critic_obs(teacher_next_obs)),
             "actor_observation": take(teacher_obs), "actor_next_observation": take(teacher_next_obs),
             "student_observation": take(self._student_observation(current_obs, current_z)),
+            "student_latent": take(current_z).detach(),
             "student_next_observation": take(self._student_observation(next_obs, next_z)),
             "action": take(sequence.actions),
             "reward": take(sequence.nstep_reward).squeeze(-1),
@@ -411,6 +428,15 @@ class OneStageFlashSACVel(FlashSACVel):
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
         return batch
 
+    def _teacher_pull_weight(self):
+        if not self.cfg.teacher_pull_enabled:
+            return 0.0
+        elapsed = self._perception_updates - self.cfg.teacher_pull_warmup_updates
+        if elapsed < 0:
+            return 0.0
+        ramp = self.cfg.teacher_pull_ramp_updates
+        return self.cfg.teacher_pull_coef * (min(elapsed / ramp, 1.0) if ramp else 1.0)
+
     def _update_once(self):
         sequence = self.buffer.sample()
         batch = self._sac_batch(sequence)
@@ -419,6 +445,8 @@ class OneStageFlashSACVel(FlashSACVel):
             self._temperature, self._student_temperature, self.flash_cfg,
             self._update_step % self.cfg.actor_update_period == 0,
             self.device, self._grad_scaler,
+            teacher_pull_coef=self._teacher_pull_weight(),
+            teacher_pull_max_grad_ratio=self.cfg.teacher_pull_max_grad_ratio,
         )
         self._update_step += 1
         return info
@@ -431,6 +459,7 @@ class OneStageFlashSACVel(FlashSACVel):
         info.update({"perception/version": self._perception_version,
                      "perception/updates": self._perception_updates,
                      "sac/student/actor/lr": self._student.optimizer.param_groups[0]["lr"]})
+        info["sac/teacher/actor/pull_scheduled_coef"] = self._teacher_pull_weight()
         if self.buffer is not None:
             info["replay/bytes"] = self.buffer.nbytes()
         return info

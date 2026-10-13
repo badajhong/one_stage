@@ -49,7 +49,9 @@ from ..utils.valuenorm import ValueNorm1, ValueNormFake
 from ..modules.distributions import IndependentNormal
 from .common import *
 
-torch.set_float32_matmul_precision('high')
+from active_adaptation.utils.torch_compat import enable_tf32
+
+enable_tf32()
 
 import active_adaptation
 import torch.distributed as distr

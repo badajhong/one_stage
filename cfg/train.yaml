@@ -27,7 +27,7 @@ camera_follow: true
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train
-  project: vaic
+  project: vaic_one_stage
   mode: online # set to 'disabled' when debugging locally
   tags: []
 

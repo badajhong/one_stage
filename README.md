@@ -84,6 +84,47 @@ The default is GPO-clip: all environments execute the guider, and the learner's
 depth/object/GRU perception is trained jointly through the GPO objective.
 See [GPO settings, checkpoint resume and verification](active_adaptation/learning/gpo/README.md).
 
+One-stage FlashSAC (Linux ARM64 DGX Spark and x86_64 NVIDIA desktops):
+
+```bash
+python scripts/train.py \
+  algo=one_stage_flashsac_vel_train \
+  task=G1/flashsac/skateboard_general_tracking
+```
+
+Teacher latent pull loss is enabled by default with a maximum weight of `0.001`,
+perception warm-up, a linear ramp, and a gradient norm cap. Disable it with
+`algo.teacher_pull_enabled=false`. See the
+[Korean explanation and settings](active_adaptation/learning/flashsac/README.md#teacher-latent-pull-loss-기본-활성화).
+
+Use Isaac Sim 5.1 and Isaac Lab **v2.3.2** as in the setup above. Isaac Lab
+v2.3.0 lacks the multi-mesh ray caster required by the depth sensor. On Spark,
+keep the CUDA-enabled ARM64 PyTorch build supplied with your environment;
+installing this repository with `pip install --no-deps -e .` preserves it
+when the other dependencies are already installed.
+
+The training entry point automatically preloads OpenMP on Linux ARM64 and
+initializes Isaac Sim before TorchRL selects its multiprocessing method.
+It preserves the training worker start method; x86_64 skips this bootstrap.
+Hydra `--cfg job` and `--help` do not initialize the simulator.
+
+For a small end-to-end check with logging disabled:
+
+```bash
+python scripts/train.py \
+  algo=one_stage_flashsac_vel_train \
+  task=G1/flashsac/skateboard_general_tracking \
+  wandb.mode=disabled algo.num_envs=4 \
+  algo.buffer_max_length=512 algo.buffer_min_length=256 \
+  algo.sample_batch_size=64 algo.updates_per_interaction_step=1 \
+  total_frames=512 task.max_episode_length=64 save_interval=-1
+```
+
+The full defaults use 4096 environments and a 10-million-transition CPU replay
+buffer. Adjust `algo.num_envs` and `algo.buffer_max_length` for available RAM;
+the replay must hold at least 81 steps per environment with the default history
+settings. See [FlashSAC settings](active_adaptation/learning/flashsac/README.md).
+
 
 ## Acknowledgments
 

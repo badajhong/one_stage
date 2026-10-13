@@ -28,7 +28,9 @@ from ..modules.distributions import IndependentNormal
 from ..modules.rnn import set_recurrent_mode, recurrent_mode
 from .common import *
 
-torch.set_float32_matmul_precision('high')
+from active_adaptation.utils.torch_compat import enable_tf32
+
+enable_tf32()
 
 OBJECT_KEY = "object_"
 DEPTH_KEY = "depth"       # student depth input (RGB-D camera)

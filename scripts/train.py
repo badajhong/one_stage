@@ -1,3 +1,7 @@
+if __name__ == "__main__":
+    from runtime_bootstrap import bootstrap_isaac_arm64
+    bootstrap_isaac_arm64()
+
 import torch
 # import warp
 import hydra
@@ -18,7 +22,6 @@ from setproctitle import setproctitle
 # Prefer this checkout over an editable install from another VAIC repository.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import active_adaptation as aa
-from isaaclab.app import AppLauncher
 # from active_adaptation.utils.torchrl import SyncDataCollector
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict.nn import TensorDictModuleBase
@@ -26,9 +29,9 @@ from tensordict import TensorDict
 
 # local import
 from helpers import make_env_policy, EpisodeStats, evaluate
+from active_adaptation.utils.torch_compat import enable_tf32
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+enable_tf32(cudnn=True)
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
@@ -164,6 +167,11 @@ def main(cfg: DictConfig):
         cfg.app.enable_cameras = True
 
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
+    # Isaac Sim's ARM64 preload check spawns a process that reimports this file.
+    # Keep this import inside main() so the child cannot start another check.
+    # This also works on x86_64 without changing the multiprocessing start method.
+    from isaaclab.app import AppLauncher
+
     app_launcher = AppLauncher(
         OmegaConf.to_container(cfg.app),
         distributed=aa.is_distributed(),

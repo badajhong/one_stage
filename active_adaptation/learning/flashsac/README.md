@@ -11,7 +11,7 @@
 
 - Teacher는 기존 `FlashSACVel`의 `encoder_priv`, privileged input 구성,
   object geometry 변환, 선택적인 height encoder를 유지합니다.
-  Teacher encoder는 teacher SAC loss로 계속 학습합니다.
+  Teacher encoder는 teacher SAC loss와 아래의 작은 latent pull loss로 학습합니다.
 - Student perception은 scratch부터 시작합니다. 기존 두 GRU 대신 다음
   gate + shared belief GRU를 사용합니다.
 
@@ -48,6 +48,71 @@ continuation을 학습합니다. Q optimizer와 target EMA는 공동 update당
 같은 혼합 batch로 학습합니다. SAC batch는 유효 transition을 출처별로
 절반씩 뽑고, perception loss는 유효 transition 수가 달라도 각 출처의
 총 가중치가 0.5가 되도록 계산합니다.
+
+## Teacher latent pull loss (기본 활성화)
+
+현재 `one_stage_flashsac_vel` 및 `one_stage_flashsac_vel_train`은 teacher의
+`encoder_priv`가 student가 추정하기 쉬운 latent를 만들도록 약하게 정규화합니다.
+기존 실행 명령에 추가 옵션을 넣지 않아도 활성화됩니다.
+
+```text
+teacher loss = teacher SAC loss + effective_coef × mean((z_teacher - z_student.detach())²)
+student perception loss = priv_loss_coef × mean((z_student - z_teacher.detach())²)
+                        + object_loss_coef × object_loss
+```
+
+Pull target은 같은 replay transition의 현재 student perception 출력입니다.
+기존 recurrent burn-in, valid mask와 teacher/student 50:50 sampling을 그대로
+사용합니다. Pull loss는 `encoder_priv`에만 gradient를 보내며, student
+perception, teacher의 policy head, critic, 선택적인 height encoder에는 직접
+gradient를 보내지 않습니다. Teacher SAC loss와 **동일한 optimizer step**에서
+합쳐 처리하고, actor update를 건너뛰는 step에는 pull도 적용하지 않습니다.
+
+| 설정 | 기본값 | 의미 |
+|---|---:|---|
+| `teacher_pull_enabled` | `true` | Teacher pull 활성화 |
+| `teacher_pull_coef` | `0.001` | 선형 증가 후의 최대 MSE 가중치 |
+| `teacher_pull_warmup_updates` | `100` | 초기 perception update 동안 가중치 0 |
+| `teacher_pull_ramp_updates` | `1000` | 이후 최대 가중치까지 증가할 perception update 수 |
+| `teacher_pull_max_grad_ratio` | `0.1` | Encoder의 RL gradient norm 대비 pull gradient norm 상한 |
+
+Schedule은 수집 frame이나 SAC update가 아니라 **perception optimizer update
+횟수** 기준입니다. 기본 설정에서 100회까지 가중치가 0이고, 600회에서는
+0.0005, 1100회부터는 0.001입니다. Resume 시 저장된 perception update
+counter를 이어 사용합니다. Warm-start한 새 student는 0부터 시작합니다.
+`teacher_pull_ramp_updates=0`이면 warm-up 종료 후 바로 최대 가중치를 씁니다.
+
+작은 가중치만으로 gradient가 작다는 보장은 없으므로 매 teacher actor update에서
+encoder의 RL gradient norm과 pull gradient norm을 비교해 실제 가중치를
+더 낮출 수 있습니다. RL gradient가 0이면 pull도 0입니다. 이 10% 제한은
+**Adam 적용 전 raw gradient norm** 기준이며, parameter 변화나 성능 저하를
+10% 이내로 보장하는 것은 아닙니다. AMP에서는 scaled gradient를 측정한 뒤
+unscale하여 비교합니다. 이 측정에는 추가 backward 계산 비용이 있습니다.
+
+W&B의 `sac/teacher/actor/` 아래에서 다음을 확인할 수 있습니다.
+
+- `pull_scheduled_coef`: 현재 warm-up/ramp 가중치.
+- `pull_coef`, `pull_effective_coef`: actor update 당시 예정/실제 가중치.
+- `pull_loss`, `pull_weighted_loss`: 원래 MSE와 가중치를 적용한 값.
+- `sac_loss`, `loss`: 기존 actor objective와 pull을 더한 전체 objective.
+- `pull_grad_norm`, `rl_encoder_grad_norm`, `pull_grad_ratio`: gradient 크기와 적용 비율.
+- `teacher_latent_std`, `student_latent_std`: batch 내 latent 변화량의 차원별 표준편차 평균.
+
+Pull 관련 update 지표는 가중치가 양수인 teacher actor update에서 기록됩니다.
+`pull_scheduled_coef`는 warm-up 중에도 기록됩니다. Latent MSE가 줄어도 두
+latent가 상수에 가까워진 것일 수 있으므로 teacher/student tracking 성능과
+latent 표준편차를 함께 비교해야 합니다. 기본 수치는 보수적인 실험 시작값이며,
+장기 학습 성능 개선은 검증되지 않았습니다.
+
+기존 방식과 비교하려면 같은 명령에 다음을 추가합니다.
+
+```bash
+algo.teacher_pull_enabled=false
+```
+
+`algo.teacher_pull_coef=0`도 pull을 완전히 끕니다. 테스트용 짧은 run에서
+pull 경로를 확인하려면 `algo.teacher_pull_warmup_updates=0
+algo.teacher_pull_ramp_updates=2`를 사용할 수 있습니다.
 
 ## Replay와 recurrent history
 

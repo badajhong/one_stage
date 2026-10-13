@@ -1,0 +1,7 @@
+# @package task
+# Share the student task's depth observations and skateboard dynamics.
+defaults:
+  - /task/G1/cts/skateboard_general_tracking@_here_
+  - _self_
+
+name: G1FlashSACSkateboardGeneralTracking

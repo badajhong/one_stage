@@ -56,6 +56,43 @@ def _min_q_log_probs(qs: torch.Tensor, log_probs: torch.Tensor) -> torch.Tensor:
     return log_probs.gather(0, indices)[0]
 
 
+def _teacher_pull_loss(actor, batch, rl_loss, coefficient, max_grad_ratio, grad_scale=1.0):
+    """Align only encoder_priv to the detached, time-aligned student latent.
+
+    Cap the auxiliary *raw gradient norm*, not the Adam parameter update, to a
+    fraction of the RL/BC gradient norm on the same encoder parameters.
+    """
+    with torch.autocast(device_type=batch["actor_observation"].device.type, enabled=False):
+        teacher_z = actor.encode_priv(batch["actor_observation"].float(), detach_inputs=True)
+        student_z = batch["student_latent"].detach().float()
+        if teacher_z.shape != student_z.shape:
+            raise ValueError("teacher pull requires matching teacher/student latent shapes")
+        loss = (teacher_z - student_z).square().mean()
+    parameters = tuple(p for p in actor.encoder_priv.parameters() if p.requires_grad)
+
+    def grad_norm(value):
+        # Match GradScaler's backward precision; unscaled AMP probes can
+        # underflow even when the actual scaled optimizer backward is healthy.
+        gradients = torch.autograd.grad(value * grad_scale, parameters, retain_graph=True, allow_unused=True)
+        squares = [(g.detach().float() / grad_scale).square().sum() for g in gradients if g is not None]
+        return torch.stack(squares).sum().sqrt() if squares else loss.new_zeros(())
+
+    rl_norm = grad_norm(rl_loss)
+    pull_norm = grad_norm(loss)
+    # Detached coefficient: do not differentiate through gradient balancing.
+    effective = torch.minimum(loss.new_tensor(coefficient),
+                              max_grad_ratio * rl_norm / pull_norm.clamp_min(1e-12)).detach()
+    weighted = effective * loss
+    return weighted, {
+        "pull_loss": loss.detach(), "pull_weighted_loss": weighted.detach(),
+        "pull_coef": loss.new_tensor(coefficient), "pull_effective_coef": effective,
+        "pull_grad_norm": pull_norm, "rl_encoder_grad_norm": rl_norm,
+        "pull_grad_ratio": effective * pull_norm / rl_norm.clamp_min(1e-12),
+        "teacher_latent_std": teacher_z.detach().std(dim=0, unbiased=False).mean(),
+        "student_latent_std": student_z.std(dim=0, unbiased=False).mean(),
+    }
+
+
 def _policy_update(
     actor: Network,
     critic: Network,
@@ -64,6 +101,7 @@ def _policy_update(
     cfg: Any,
     device: torch.device,
     grad_scaler: Optional[GradScaler],
+    regularizer=None,
 ) -> dict[str, torch.Tensor]:
     # Upstream update_actor freezes critic parameters and uses training=False
     # for its forward, preserving dQ/da without updating critic BatchNorm.
@@ -80,6 +118,7 @@ def _policy_update(
             device=device,
             use_amp=cfg.use_amp,
             grad_scaler=grad_scaler,
+            regularizer=regularizer,
         )
     finally:
         for parameter, enabled in zip(critic_parameters, requires_grad):
@@ -100,6 +139,9 @@ def update_joint_networks(
     do_actor_update: bool,
     device: torch.device,
     grad_scaler: Optional[GradScaler],
+    *,
+    teacher_pull_coef: float = 0.0,
+    teacher_pull_max_grad_ratio: float = 0.1,
 ) -> dict[str, torch.Tensor]:
     """Update both policies, one shared twin Q, and its target exactly once.
 
@@ -120,8 +162,14 @@ def update_joint_networks(
     student_batch["actor_next_observation"] = batch["student_next_observation"].detach()
     info: dict[str, torch.Tensor] = {}
     if do_actor_update:
+        regularizer = None
+        if teacher_pull_coef > 0:
+            raw_teacher = getattr(teacher.network, "_orig_mod", teacher.network)
+            regularizer = lambda rl_loss: _teacher_pull_loss(
+                raw_teacher, batch, rl_loss, teacher_pull_coef, teacher_pull_max_grad_ratio,
+                grad_scaler.get_scale() if cfg.use_amp and grad_scaler is not None else 1.0)
         teacher_info = _policy_update(
-            teacher, critic, teacher_temperature, batch, cfg, device, grad_scaler
+            teacher, critic, teacher_temperature, batch, cfg, device, grad_scaler, regularizer
         )
         student_info = _policy_update(
             student, critic, student_temperature, student_batch, cfg, device, grad_scaler

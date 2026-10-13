@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch.amp.grad_scaler import GradScaler
@@ -87,6 +87,7 @@ def update_actor(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    regularizer: Optional[Callable[[torch.Tensor], tuple[torch.Tensor, dict[str, torch.Tensor]]]] = None,
 ) -> dict[str, torch.Tensor]:
     """Update actor network.
 
@@ -99,6 +100,8 @@ def update_actor(
         device: Device to use.
         use_amp: Whether to use automatic mixed precision.
         grad_scaler: GradScaler for FP16 AMP.
+        regularizer: Optional auxiliary loss and metrics, evaluated before the
+            same actor optimizer step. Receives the unscaled RL/BC loss.
     """
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
@@ -134,6 +137,12 @@ def update_actor(
         entropy = -log_probs.mean()
         mean_action = actions.mean()
 
+    regularization_info = {}
+    if regularizer is not None:
+        extra_loss, regularization_info = regularizer(actor_loss)
+        regularization_info["sac_loss"] = actor_loss.detach()
+        actor_loss = actor_loss + extra_loss
+
     # Gradient step
     assert actor.optimizer is not None
     actor.optimizer.zero_grad(set_to_none=True)
@@ -158,6 +167,7 @@ def update_actor(
         "loss": actor_loss,
         "entropy": entropy,
         "mean_action": mean_action,
+        **regularization_info,
     }
     update_info = add_prefix_to_keys(update_info, "actor")
 

@@ -5,9 +5,10 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
+from hydra import compose, initialize_config_dir
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
 from tensordict import TensorDict
@@ -101,6 +102,21 @@ class FakePolicy:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_flashsac_skateboard_command_resolves_required_task_fields(self):
+        with initialize_config_dir(config_dir=str(ROOT / "cfg"), version_base=None):
+            cfg = compose(config_name="train", overrides=[
+                "algo=one_stage_flashsac_vel_train",
+                "task=G1/flashsac/skateboard_general_tracking",
+            ])
+        OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+        self.assertEqual(cfg.task.robot.name, "g1")
+        self.assertEqual(len(cfg.task.command.data_path), 2)
+        self.assertIn("depth_camera", cfg.task.observation.depth)
+        self.assertEqual((cfg.task.camera_width, cfg.task.camera_height), (64, 36))
+        self.assertIsNone(cfg.vecnorm)
+        self.assertTrue(cfg.algo.teacher_pull_enabled)
+        self.assertEqual(cfg.algo.teacher_pull_coef, .001)
+
     def test_environment_count_and_raycast_rendering_config(self):
         for render in (False, True):
             cfg = OmegaConf.create({
@@ -110,7 +126,8 @@ class RunnerTests(unittest.TestCase):
                 "eval_render": render,
             })
             # Intercept launcher construction before any simulation or W&B side effects.
-            with patch.object(runner, "AppLauncher", side_effect=RuntimeError("intercept")) as launch:
+            launch = Mock(side_effect=RuntimeError("intercept"))
+            with patch.dict(sys.modules, {"isaaclab.app": SimpleNamespace(AppLauncher=launch)}):
                 with self.assertRaisesRegex(RuntimeError, "intercept"):
                     runner.main.__wrapped__(cfg)
             self.assertEqual(cfg.task.num_envs, 8)

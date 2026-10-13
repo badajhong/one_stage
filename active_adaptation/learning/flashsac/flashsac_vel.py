@@ -193,7 +193,7 @@ class VAICFlashSACActor(nn.Module):
             transformed.append(torch.matmul(object_points, ori.transpose(-1, -2)) + pos.unsqueeze(-2))
         return torch.cat(transformed, dim=-2).flatten(-2, -1)
 
-    def encode_priv(self, observation: torch.Tensor) -> torch.Tensor:
+    def encode_priv(self, observation: torch.Tensor, *, detach_inputs: bool = False) -> torch.Tensor:
         inputs = [self.field(observation, OBS_PRIV_KEY)]
         if self.has_object:
             inputs.extend([
@@ -202,7 +202,9 @@ class VAICFlashSACActor(nn.Module):
             ])
         if self.has_height:
             inputs.append(self.height_cnn(self.field(observation, HEIGHT_KEY)))
-        return self.encoder_priv(torch.cat(inputs, dim=-1))
+        inputs = torch.cat(inputs, dim=-1)
+        # Auxiliary teacher alignment must not train upstream feature encoders.
+        return self.encoder_priv(inputs.detach() if detach_inputs else inputs)
 
     def actor_input(self, observation: torch.Tensor) -> torch.Tensor:
         priv_feature = self.encode_priv(observation)
