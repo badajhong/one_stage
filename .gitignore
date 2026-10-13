@@ -194,3 +194,7 @@ test/
 
 # models
 teachers/
+
+# diagnostics
+diagnostics/
+results/

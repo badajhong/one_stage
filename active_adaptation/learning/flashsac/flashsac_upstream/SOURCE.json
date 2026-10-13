@@ -1,0 +1,174 @@
+{
+  "repository": "https://github.com/Holiday-Robot/FlashSAC.git",
+  "commit": "87edc9061150ae9e962dd84e6544e27a1554b3ab",
+  "files": {
+    "layer.py": {
+      "upstream_path": "flash_rl/agents/flashSAC/layer.py",
+      "upstream_sha256": "7af7b2954c22a5ae56595b8d3139017e2a44b17dbd63c2f54c4e65dbd17ef7cc",
+      "vendored_sha256": "e44d18b47efc57b349d556951c3a2b16377a53f8d50335be68a186572d98231e",
+      "rewritten_import_lines": [
+        {
+          "line": 7,
+          "upstream": "from flash_rl.agents.utils.distribution import safe_tanh_log_det_jacobian",
+          "vendored": "from .distribution import safe_tanh_log_det_jacobian"
+        }
+      ]
+    },
+    "network.py": {
+      "upstream_path": "flash_rl/agents/flashSAC/network.py",
+      "upstream_sha256": "4068098466f195fac2c7d91e3cb1abe0c4daf42c4d1cd85f3940dca9edfd4c98",
+      "vendored_sha256": "170b4b370e37663b8954958339ec68595e3fae21dd1cc243afc7a02e3ffa2d20",
+      "rewritten_import_lines": [
+        {
+          "line": 6,
+          "upstream": "from flash_rl.agents.flashSAC.layer import (",
+          "vendored": "from .layer import ("
+        }
+      ]
+    },
+    "update.py": {
+      "upstream_path": "flash_rl/agents/flashSAC/update.py",
+      "upstream_sha256": "6134612e4ad43089dd44ce06cb6644546e864a3de13bb12525cb631e65aa30ef",
+      "vendored_sha256": "dd6da11d492d8a50551658fc2d80c3139fe4b6a2fc2ae95a78213e311218d777",
+      "rewritten_import_lines": [
+        {
+          "line": 6,
+          "upstream": "from flash_rl.agents.utils.network import Network",
+          "vendored": "from .utils_network import Network"
+        },
+        {
+          "line": 7,
+          "upstream": "from flash_rl.buffers import Batch",
+          "vendored": "from .base_buffer import Batch"
+        }
+      ]
+    },
+    "agent.py": {
+      "upstream_path": "flash_rl/agents/flashSAC/agent.py",
+      "upstream_sha256": "e1bb9c49cdf1b72507705403801a5dc993471a89f69dbcee973f14949895595a",
+      "vendored_sha256": "539f77e4967361dabffe1854a0f4f91a451f207f8c06fbfa66abd28239459434",
+      "rewritten_import_lines": [
+        {
+          "line": 11,
+          "upstream": "from flash_rl.agents.base_agent import BaseAgent",
+          "vendored": "from .base_agent import BaseAgent"
+        },
+        {
+          "line": 12,
+          "upstream": "from flash_rl.agents.flashSAC.network import (",
+          "vendored": "from .network import ("
+        },
+        {
+          "line": 17,
+          "upstream": "from flash_rl.agents.flashSAC.update import (",
+          "vendored": "from .update import ("
+        },
+        {
+          "line": 23,
+          "upstream": "from flash_rl.agents.utils.network import Network",
+          "vendored": "from .utils_network import Network"
+        },
+        {
+          "line": 24,
+          "upstream": "from flash_rl.agents.utils.reward_normalization import RewardNormalizer",
+          "vendored": "from .reward_normalization import RewardNormalizer"
+        },
+        {
+          "line": 25,
+          "upstream": "from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler",
+          "vendored": "from .scheduler import warmup_cosine_decay_scheduler"
+        },
+        {
+          "line": 26,
+          "upstream": "from flash_rl.buffers.torch_buffer import TorchUniformBuffer",
+          "vendored": "from .torch_buffer import TorchUniformBuffer"
+        },
+        {
+          "line": 27,
+          "upstream": "from flash_rl.types import NDArray, Tensor",
+          "vendored": "from ._types import NDArray, Tensor"
+        }
+      ]
+    },
+    "base_agent.py": {
+      "upstream_path": "flash_rl/agents/base_agent.py",
+      "upstream_sha256": "d58f98e02eed8887c16f5f7d83d97f16e4a7ac0d104dc40d1809bf3832a72dfc",
+      "vendored_sha256": "68976d1d09bd4183a2503894d09251937e4509083e0f4394ddc7ce67a613e4d5",
+      "rewritten_import_lines": [
+        {
+          "line": 6,
+          "upstream": "from flash_rl.types import NDArray, Tensor",
+          "vendored": "from ._types import NDArray, Tensor"
+        }
+      ]
+    },
+    "utils_network.py": {
+      "upstream_path": "flash_rl/agents/utils/network.py",
+      "upstream_sha256": "02b1e8c27ae2d75ba39969a5ea6b21e1bc596dbab71fdd6c5dc9cd5d7aab1d69",
+      "vendored_sha256": "02b1e8c27ae2d75ba39969a5ea6b21e1bc596dbab71fdd6c5dc9cd5d7aab1d69",
+      "rewritten_import_lines": []
+    },
+    "reward_normalization.py": {
+      "upstream_path": "flash_rl/agents/utils/reward_normalization.py",
+      "upstream_sha256": "b673f5fba40468f6bb183d3cc82daa05111e95407ccb6b73de854f338c7b70b8",
+      "vendored_sha256": "b673f5fba40468f6bb183d3cc82daa05111e95407ccb6b73de854f338c7b70b8",
+      "rewritten_import_lines": []
+    },
+    "scheduler.py": {
+      "upstream_path": "flash_rl/agents/utils/scheduler.py",
+      "upstream_sha256": "b3732509dbe01a01d76b3018d062386287bf7cb669973e2a465192c584030811",
+      "vendored_sha256": "b3732509dbe01a01d76b3018d062386287bf7cb669973e2a465192c584030811",
+      "rewritten_import_lines": []
+    },
+    "distribution.py": {
+      "upstream_path": "flash_rl/agents/utils/distribution.py",
+      "upstream_sha256": "30c2987d80238ccc9c59dd6f7a9dd4056ed01773901d3d08a0db8c40f61b76ed",
+      "vendored_sha256": "30c2987d80238ccc9c59dd6f7a9dd4056ed01773901d3d08a0db8c40f61b76ed",
+      "rewritten_import_lines": []
+    },
+    "torch_buffer.py": {
+      "upstream_path": "flash_rl/buffers/torch_buffer.py",
+      "upstream_sha256": "663ec003992ebda3c029c963eb93db8b902bc666cdd76f451e7cb348d37439a9",
+      "vendored_sha256": "1258387174d3a7e84bd64f580d500ba1fd5d3457e961a317ca6eee39c3421e34",
+      "rewritten_import_lines": [
+        {
+          "line": 9,
+          "upstream": "from flash_rl.buffers.base_buffer import BaseBuffer, Batch",
+          "vendored": "from .base_buffer import BaseBuffer, Batch"
+        },
+        {
+          "line": 10,
+          "upstream": "from flash_rl.types import NDArray",
+          "vendored": "from ._types import NDArray"
+        }
+      ]
+    },
+    "base_buffer.py": {
+      "upstream_path": "flash_rl/buffers/base_buffer.py",
+      "upstream_sha256": "75a067a6d8a3d4d6098961a557d78bbb42e73bfd5e6e1e37b41c9d70fb263699",
+      "vendored_sha256": "6f25d18f19dafdb29d18cfc12cfff9ed5bc55ac444fbfcfe4ba92f1c0b6d138a",
+      "rewritten_import_lines": [
+        {
+          "line": 6,
+          "upstream": "from flash_rl.types import NDArray, Tensor",
+          "vendored": "from ._types import NDArray, Tensor"
+        }
+      ]
+    }
+  },
+  "local_files": {
+    "__init__.py": "VAIC-authored, empty package marker.",
+    "_types.py": "VAIC-authored replacement for flash_rl/types.py without the jax import."
+  },
+  "local_modifications": {
+    "agent.py": {
+      "description": "Copied from sibling VAIC checkout: ramp-cosine learning-rate schedule and matching FlashSACConfig fields.",
+      "sha256": "c08f088e0c6bdfee22effc72396dbf466825d82e474586445bc70a591829a01a"
+    },
+    "scheduler.py": {
+      "description": "Copied from sibling VAIC checkout: adds ramp_cosine_decay_scheduler.",
+      "sha256": "87d33f5069a0ec126baf83a8c3697ee3e92cc6ea785df075fbb1a78487780143"
+    }
+  },
+  "license": "MIT; LICENSE copied from the repository at the recorded commit."
+}
